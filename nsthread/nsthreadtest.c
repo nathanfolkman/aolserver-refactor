@@ -125,7 +125,7 @@ RecursiveStackCheck(int n)
     return n;
 }
 
-void 
+void
 CheckStackThread(void *arg)
 {
     int n;
@@ -318,6 +318,15 @@ DumperThread(void *arg)
     Ns_Time         to;
     Tcl_DString     ds;
 
+    /*
+     * Initialize Tcl per-thread state.  Worker threads created via
+     * Ns_ThreadCreate bypass Tcl's own thread-creation path, so Tcl's
+     * internal TLS keys are not set up automatically.  Creating an
+     * interpreter is the standard way to attach a foreign thread to Tcl.
+     * The return value is intentionally discarded — Tcl's pthread-key
+     * destructor reclaims the interpreter at thread exit.
+     */
+    (void) Tcl_CreateInterp();
     Tcl_DStringInit(&ds);
     Ns_ThreadSetName("-dumper-");
     Ns_MutexLock(&block);
@@ -331,15 +340,19 @@ DumperThread(void *arg)
 	DumpString(&ds);
 	Ns_MutexList(&ds);
 	DumpString(&ds);
-#if !defined(_WIN32) && defined(USE_THREAD_ALLOC) && (STATIC_BUILD == 0)
-	/* NB: Not yet exported in WIN32 Tcl. */
-	Tcl_GetMemoryInfo(&ds);
-#endif
-	DumpString(&ds);
 	Ns_MutexUnlock(&mlock);
     }
     Ns_MutexUnlock(&dlock);
     Ns_MutexUnlock(&block);
+    Tcl_DStringFree(&ds);
+    /*
+     * Intentionally do not call Tcl_DeleteInterp here.  DumperThread is
+     * about to exit; Tcl's per-thread cleanup (via pthread key destructor)
+     * will reclaim the interpreter and per-thread resources automatically.
+     * Calling Tcl_DeleteInterp from a foreign (non-Tcl-created) thread
+     * can trigger notifier finalization and memory introspection that are
+     * unsafe at this point.
+     */
 }
 
 
@@ -428,6 +441,7 @@ int main(int argc, char *argv[])
 #endif
 
     NsThreads_LibInit();
+    Tcl_FindExecutable(argv[0]);
     Ns_ThreadSetName("-main-");
 
     /*
@@ -482,6 +496,7 @@ int main(int argc, char *argv[])
 	printf("pthread: create %d = %d\n", i, (int) tids[i]);
 	Ns_ThreadYield();
     }
+    sleep(6); /* Wait for all pthreads to finish sleep(5) and enter condwait */
     Ns_MutexLock(&plock);
     pgo = 1;
     Ns_MutexUnlock(&plock);
@@ -499,7 +514,7 @@ int main(int argc, char *argv[])
     Ns_ThreadJoin(&dumper, NULL);
     Msg("threads joined");
     for (i = 0; i < 10; ++i) {
-	Ns_ThreadCreate(CheckStackThread, NULL, 8192*(i+1), &threads[i]);
+	Ns_ThreadCreate(CheckStackThread, NULL, 131072*(i+1), &threads[i]);
     }
     for (i = 0; i < 10; ++i) {
         Ns_ThreadJoin(&threads[i], &arg);

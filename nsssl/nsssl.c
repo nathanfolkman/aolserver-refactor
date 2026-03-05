@@ -11,7 +11,7 @@
  *
  * The Original Code is AOLserver Code and related documentation
  * distributed by AOL.
- * 
+ *
  * The Initial Developer of the Original Code is America Online,
  * Inc. Portions created by AOL are Copyright (C) 1999 America Online,
  * Inc. All Rights Reserved.
@@ -27,116 +27,140 @@
  * version of this file under either the License or the GPL.
  */
 
-/* 
+/*
  * nsssl.c --
  *
- *	Call internal Ns_DriverInit.
- *
+ *      SSL driver for AOLserver using OpenSSL.
  */
 
 #include "ns.h"
-#include "ssl.h"
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/x509.h>
 
-#ifdef SSL_EXPORT 
-#define DRIVER_NAME "nsssle"
-#else
 #define DRIVER_NAME "nsssl"
-#endif
 
 static Ns_DriverProc SSLProc;
 
-NS_EXPORT int Ns_ModuleVersion = 1;
-
-
 /*
  *----------------------------------------------------------------------
  *
- * Ns_ModuleInit --
+ * NsSSL_ModInit --
  *
- *	Initialize the SSL driver.
+ *      Initialize the OpenSSL driver module.
  *
  * Results:
- *	NS_OK if initialized ok, NS_ERROR otherwise.
+ *      NS_OK if initialized, NS_ERROR otherwise.
  *
  * Side effects:
- *	See Ns_DriverInit.
+ *      Creates an SSL_CTX, loads certificates, and registers
+ *      the SSL driver with AOLserver.
  *
  *----------------------------------------------------------------------
  */
 
-NS_EXPORT int
-Ns_ModuleInit(char *server, char *module)
+int
+NsSSL_ModInit(char *server, char *module)
 {
     Ns_DriverInitData init;
-    char *cert, *key, *path;
-    void *dssl;
-    int n;
-
-    /*
-     * Initialize the global and per-driver SSL.
-     */
+    SSL_CTX *ctx;
+    char *path, *cert, *key, *ciphers;
+    int verify;
 
     path = Ns_ConfigGetPath(server, module, NULL);
-    if (NsSSLInitialize(server, module) != NS_OK) { 
-        Ns_Log(Error, "%s: failed to initialize ssl driver", module);
-        return NS_ERROR; 
-    } 
-    cert = Ns_ConfigGet(path, "certfile"); 
 
-    if (cert == NULL) { 
-        Ns_Log(Warning, "%s: certfile not specified", module); 
-        return NS_OK; 
-    } 
-#ifdef SSL_EXPORT 
-    n = 40;
-#else
-    n = 128;
-#endif
-    Ns_Log(Notice, "%s: initialized with %d-bit encryption", module, n);
-
-#ifdef HAVE_SWIFT
-    Ns_Log(Notice, "%s: SUPPORTS RAINBOW CRYPTOSWIFT HARDWARE SSL ACCELERATOR",
-	   module);
-#endif
-    key = Ns_ConfigGet(path, "keyfile"); 
-    dssl = NsSSLCreateServer(cert, key);
-    if (dssl == NULL) {
+    cert = Ns_ConfigGet(path, "certificate");
+    if (cert == NULL) {
+        Ns_Log(Error, "%s: certificate parameter required", module);
         return NS_ERROR;
     }
 
+    key = Ns_ConfigGet(path, "key");
+    if (key == NULL) {
+        key = cert;
+    }
+
     /*
-     * Initialize the driver without the async option so all I/O
+     * Initialize OpenSSL.
+     */
+
+    OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS
+                     | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
+
+    ctx = SSL_CTX_new(TLS_server_method());
+    if (ctx == NULL) {
+        Ns_Log(Error, "%s: SSL_CTX_new failed", module);
+        return NS_ERROR;
+    }
+
+    SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
+
+    if (SSL_CTX_use_certificate_chain_file(ctx, cert) != 1) {
+        Ns_Log(Error, "%s: failed to load certificate: %s", module, cert);
+        SSL_CTX_free(ctx);
+        return NS_ERROR;
+    }
+
+    if (SSL_CTX_use_PrivateKey_file(ctx, key, SSL_FILETYPE_PEM) != 1) {
+        Ns_Log(Error, "%s: failed to load private key: %s", module, key);
+        SSL_CTX_free(ctx);
+        return NS_ERROR;
+    }
+
+    if (SSL_CTX_check_private_key(ctx) != 1) {
+        Ns_Log(Error, "%s: private key does not match certificate", module);
+        SSL_CTX_free(ctx);
+        return NS_ERROR;
+    }
+
+    ciphers = Ns_ConfigGet(path, "ciphers");
+    if (ciphers != NULL) {
+        if (SSL_CTX_set_cipher_list(ctx, ciphers) != 1) {
+            Ns_Log(Error, "%s: failed to set cipher list: %s", module, ciphers);
+            SSL_CTX_free(ctx);
+            return NS_ERROR;
+        }
+    }
+
+    if (Ns_ConfigGetBool(path, "verify", &verify) && verify) {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER
+                           | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
+    }
+
+    Ns_Log(Notice, "%s: initialized OpenSSL with cert %s", module, cert);
+
+    /*
+     * Register the driver without the async option so all I/O
      * happens in the connection thread, avoiding any possible
-     * blocking in the driver thread due to SSL overhead.  Set
-     * the SSL option to use the SSL port and protocol defaults.
+     * blocking in the driver thread due to SSL overhead.
      */
 
     init.version = NS_DRIVER_VERSION_1;
     init.name = DRIVER_NAME;
     init.proc = SSLProc;
-    init.arg = dssl;
+    init.arg = ctx;
     init.opts = NS_DRIVER_SSL;
     init.path = NULL;
 
     return Ns_DriverInit(server, module, &init);
 }
 
-
+
 /*
  *----------------------------------------------------------------------
  *
  * SSLProc --
  *
- *	SSL driver callback proc.  This driver performs the necessary
- *	handshake and encryption of SSL.
+ *      SSL driver callback. Handles TLS handshake, read, write,
+ *      and close operations using OpenSSL.
  *
  * Results:
- *	For close, always 0.  For keep, 0 if connection could be
- *	properly flushed, -1 otherwise.  For send and recv, # of bytes
- *	processed or -1 on error.
+ *      For close, always 0. For keep, 0 if connection could be
+ *      properly shut down, -1 otherwise. For send and recv, number
+ *      of bytes processed or -1 on error.
  *
  * Side effects:
- *	None.
+ *      None.
  *
  *----------------------------------------------------------------------
  */
@@ -145,68 +169,72 @@ static int
 SSLProc(Ns_DriverCmd cmd, Ns_Sock *sock, struct iovec *bufs, int nbufs)
 {
     Ns_Driver *driver = sock->driver;
+    SSL_CTX *ctx;
+    SSL *ssl;
     int n, total;
 
     switch (cmd) {
     case DriverRecv:
     case DriverSend:
-	/*
-	 * On first I/O, initialize the connection context.
-	 */
+        /*
+         * On first I/O, create an SSL connection and perform the handshake.
+         */
 
-	if (sock->arg == NULL) { 
-	    n = driver->recvwait;
-	    if (n > driver->sendwait) {
-		n = driver->sendwait;
-	    }
-	    sock->arg = NsSSLCreateConn(sock->sock, n, driver->arg);
-	    if (sock->arg == NULL) { 
-		return -1;
-	    } 
-	}
+        if (sock->arg == NULL) {
+            ctx = (SSL_CTX *) driver->arg;
+            ssl = SSL_new(ctx);
+            if (ssl == NULL) {
+                Ns_Log(Error, "nsssl: SSL_new failed");
+                return -1;
+            }
+            SSL_set_fd(ssl, (int) sock->sock);
+            if (SSL_accept(ssl) <= 0) {
+                Ns_Log(Warning, "nsssl: SSL_accept failed");
+                SSL_free(ssl);
+                return -1;
+            }
+            sock->arg = ssl;
+        }
 
-	/*
-	 * Process each buffer one at a time.
-	 */
-
-	total = 0;
-	do {
-	    if (cmd == DriverSend) {
-		n = NsSSLSend(sock->arg, bufs->iov_base, bufs->iov_len);
-	    } else {
-		n = NsSSLRecv(sock->arg, bufs->iov_base, bufs->iov_len);
-	    }
-	    if (n < 0 && total > 0) {
-		/* NB: Mask error if some bytes were read. */
-		n = 0;
-	    }
-	    ++bufs;
-	    total += n;
-	} while (n > 0 && --nbufs > 0);
-	n = total;
-	break;
+        ssl = (SSL *) sock->arg;
+        total = 0;
+        do {
+            if (cmd == DriverSend) {
+                n = SSL_write(ssl, bufs->iov_base, (int) bufs->iov_len);
+            } else {
+                n = SSL_read(ssl, bufs->iov_base, (int) bufs->iov_len);
+            }
+            if (n < 0 && total > 0) {
+                n = 0;
+            }
+            ++bufs;
+            total += n;
+        } while (n > 0 && --nbufs > 0);
+        n = total;
+        break;
 
     case DriverKeep:
-	if (sock->arg != NULL && NsSSLFlush(sock->arg) == NS_OK) {
-	    n = 0;
-	} else {
-	    n = -1;
-	}
-	break;
+        ssl = (SSL *) sock->arg;
+        if (ssl != NULL) {
+            n = (SSL_shutdown(ssl) >= 0) ? 0 : -1;
+        } else {
+            n = -1;
+        }
+        break;
 
     case DriverClose:
-	if (sock->arg != NULL) { 
-	    (void) NsSSLFlush(sock->arg); 
-	    NsSSLDestroyConn(sock->arg); 
-	    sock->arg = NULL;
-	}
-	n = 0;
-	break;
+        ssl = (SSL *) sock->arg;
+        if (ssl != NULL) {
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+            sock->arg = NULL;
+        }
+        n = 0;
+        break;
 
     default:
-	/* Unsupported command. */
-	n = -1;
-	break;
+        n = -1;
+        break;
     }
     return n;
 }

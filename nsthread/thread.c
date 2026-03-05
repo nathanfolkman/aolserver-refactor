@@ -523,13 +523,22 @@ Ns_CheckStack(void)
      * Check if the stack has grown into or beyond the guard.
      */
 
+    /*
+     * Include a safety margin so callers have room to unwind after
+     * Ns_CheckStack returns NS_BREAK without hitting the guard page.
+     * On macOS ARM64 the hardware page size is 16 KB; use 4 pages (64 KB)
+     * to guard against simultaneous threads whose stacks are allocated
+     * adjacently in the same virtual-address region.
+     */
+#define STACK_SAFETY 65536
+
     if (thrPtr->flags & FLAG_STACKDOWN) {
-	limit = (caddr_t) thrPtr->stackaddr - thrPtr->stacksize;
+	limit = (caddr_t) thrPtr->stackaddr - thrPtr->stacksize + STACK_SAFETY;
 	if ((caddr_t) &limit < limit) {
 	    return NS_BREAK;
 	}
     } else {
-	limit = (caddr_t) thrPtr->stackaddr + thrPtr->stacksize;
+	limit = (caddr_t) thrPtr->stackaddr + thrPtr->stacksize - STACK_SAFETY;
 	if ((caddr_t) &limit > limit) {
 	    return NS_BREAK;
 	}

@@ -42,21 +42,13 @@
 #include "nsattributes.h"
 
 
-#ifdef _WIN32
-#define NS_EXPORT		__declspec(dllexport)
-#define NS_IMPORT		__declspec(dllimport)
-#else
 #define NS_EXPORT
 #define NS_IMPORT
 #ifndef _REENTRANT
 #define _REENTRANT
 #endif
-#if defined(__sgi) && !defined(_SGI_MP_SOURCE)
-#define _SGI_MP_SOURCE
-#endif
 #if defined(__sun) && !defined(_POSIX_PTHREAD_SEMANTICS)
 #define _POSIX_PTHREAD_SEMANTICS
-#endif
 #endif
 
 #ifdef NSTHREAD_EXPORTS
@@ -87,10 +79,11 @@
 #endif
 #endif
 
-#ifndef _WIN32
 #include <sys/types.h>
+#include <stdlib.h>
 #include <dirent.h>
 #include <sys/time.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <string.h>
@@ -99,33 +92,6 @@
 #include <netdb.h>
 #include <sys/uio.h>
 
-#else
-
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#include <winsock2.h>
-#include <sys/timeb.h>
-#include <sys/types.h>
-#include <io.h>
-#include <process.h>
-#include <direct.h>
-typedef struct DIR_ *DIR;
-struct dirent {
-    char *d_name;
-};
-NS_EXTERN DIR *opendir(char *pathname);
-NS_EXTERN struct dirent *readdir(DIR *dp);
-NS_EXTERN int closedir(DIR *dp);
-#define sleep(n)	(Sleep((n)*1000))
-
-#define HAVE_GETADDRINFO
-#define HAVE_GETNAMEINFO
-#include <ws2tcpip.h>
-
-#endif
-
 #include "tcl.h"
 #include <limits.h>
 #include <time.h>
@@ -133,7 +99,6 @@ NS_EXTERN int closedir(DIR *dp);
 #include <signal.h>
 #include <errno.h>
 #include <ctype.h>
-#include <stdlib.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -275,11 +240,9 @@ NS_EXTERN void Ns_SemaPost(Ns_Sema *semaPtr, int count);
  * signal.c:
  */
 
-#ifndef _WIN32
 NS_EXTERN int ns_sigmask(int how, sigset_t * set, sigset_t * oset);
 NS_EXTERN int ns_sigwait(sigset_t * set, int *sig);
 NS_EXTERN int ns_signal(int sig, void (*proc)(int));
-#endif
 
 /*
  * thread.c:

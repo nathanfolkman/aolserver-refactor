@@ -1605,7 +1605,7 @@ static void
 Close(Proxy *proxyPtr)
 {
     Proc *procPtr = proxyPtr->procPtr;
-    static once = 0;
+    static int once = 0;
 
     if (procPtr != NULL) { 
     	close(procPtr->wfd);

@@ -30,31 +30,18 @@
 #ifndef NSD_H
 #define NSD_H
 
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
+#ifdef __linux__
+# ifndef _GNU_SOURCE
+#  define _GNU_SOURCE
+# endif
 #endif
 
 #define NSD_EXPORTS
 #include "ns.h"
 
-#ifndef _WIN32
 #include <pthread.h>
 #include <sys/mman.h>
-#endif
 #include <assert.h>
-
-#ifdef _WIN32
-
-#include <fcntl.h>
-#include <io.h>
-#define STDOUT_FILENO	1
-#define STDERR_FILENO	2
-#define S_ISREG(m)	((m)&_S_IFREG)
-#define S_ISDIR(m)	((m)&_S_IFDIR)
-#include "getopt.h"
-#include <sys/stat.h>
-
-#else
 
 #include <sys/resource.h>
 #include <sys/wait.h>
@@ -62,8 +49,6 @@
 #include <sys/stat.h>
 #include <ctype.h>
 #include <grp.h>
-
-#endif	/* WIN32 */
 
 #ifdef HAVE_POLL
   #include <poll.h>
@@ -83,9 +68,6 @@
 #ifdef __linux
   #include <sys/prctl.h>
 #endif
-#ifdef __hp
-  #define seteuid(i)     setresuid((-1),(i),(-1))
-#endif
 #ifdef __sun
   #include <sys/filio.h>
   #include <sys/systeminfo.h>
@@ -99,13 +81,8 @@
 #define F_CLOEXEC 1
 #endif
 
-#ifdef _WIN32
-#define NS_SIGTERM  1
-#define NS_SIGHUP   2
-#else
 #define NS_SIGTERM  SIGTERM
 #define NS_SIGHUP   SIGHUP
-#endif
 
 #define _MAX(x,y) ((x) > (y) ? (x) : (y))
 #define _MIN(x,y) ((x) > (y) ? (y) : (x))
@@ -180,12 +157,6 @@ struct _nsconf {
     struct {
 	int maxelapsed;
     } sched;
-
-#ifdef _WIN32    
-    struct {
-	bool checkexit;
-    } exec;
-#endif
 
     struct {
 	char *sharedlibrary;
@@ -956,12 +927,6 @@ extern void NsConnSeek(Ns_Conn *conn, int count);
 extern void *NsMap(int fd, off_t start, size_t len, int writeable, void **argPtr);
 extern void NsUnMap(void *addr, void *arg);
 
-#ifdef _WIN32
-extern int  NsConnectService(void);
-extern int  NsInstallService(char *service);
-extern int  NsRemoveService(char *service);
-#endif
-
 extern void NsCreatePidFile(char *service);
 extern void NsRemovePidFile(char *service);
 
@@ -1075,12 +1040,10 @@ extern int   NsParamInt(char *key, int def);
 extern char *NsParamString(char *key, char *def);
 
 extern int  NsCloseAllFiles(int errFd);
-#ifndef _WIN32
 extern int  Ns_ConnRunRequest(Ns_Conn *conn);
 extern int  Ns_GetGid(char *group);
 extern int  Ns_GetUserGid(char *user);
 extern int  Ns_TclGetOpenFd(Tcl_Interp *, char *, int write, int *fp);
-#endif
 extern void NsStopSockCallbacks(void);
 extern void NsStopScheduledProcs(void);
 extern Tcl_Encoding NsGetInputEncoding(Conn *connPtr);

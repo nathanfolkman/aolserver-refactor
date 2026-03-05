@@ -40,6 +40,9 @@
 /* TODO: Move to configure. */
 #ifdef __APPLE__
 #define HAVE_PTHREAD_GET_STACKADDR_NP 1
+/* Declare Apple NP extensions explicitly; hidden when _POSIX_C_SOURCE is set. */
+extern void *pthread_get_stackaddr_np(pthread_t);
+extern size_t pthread_get_stacksize_np(pthread_t);
 #endif
 #ifdef __linux
 #define HAVE_PTHREAD_GETATTR_NP 1
@@ -123,7 +126,7 @@ NsInitThreads(void)
 	NsThreadFatal("NsPthreadsInit", "pthread_key_create", err);
     }
     stackdown = StackDown(&env);
-    pagesize = getpagesize();
+    pagesize = (int)sysconf(_SC_PAGESIZE);
     env = getenv("NS_THREAD_GUARDSIZE");
     if (env == NULL
 	    || Tcl_GetInt(NULL, env, &guardsize) != TCL_OK
@@ -1005,12 +1008,12 @@ SetKey(char *func, void *arg)
  *----------------------------------------------------------------------
  */
 
-static int
+static int __attribute__((noinline))
 StackDown(char **outer)
 {
-   char *local;
+   volatile char local;
 
-   return (&local < outer ? 1 : 0);
+   return ((char *)&local < (char *)outer ? 1 : 0);
 }
 
 

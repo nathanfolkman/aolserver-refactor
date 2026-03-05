@@ -39,6 +39,10 @@
 #ifndef NS_H
 #define NS_H
 
+#ifdef HAVE_NSCONFIG_H
+#include "nsconfig.h"
+#endif
+
 #define NS_MAJOR_VERSION	4
 #define NS_MINOR_VERSION	5
 #define NS_RELEASE_SERIAL	1

@@ -1583,6 +1583,18 @@ static void JsInfoServerName(const v8::FunctionCallbackInfo<v8::Value> &args) {
     args.GetReturnValue().Set(v8s(iso, mod->server));
 }
 
+static void JsInfoBoottime(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    args.GetReturnValue().Set(static_cast<double>(Ns_InfoBootTime()));
+}
+
+static void JsInfoPlatform(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    args.GetReturnValue().Set(v8s(args.GetIsolate(), Ns_InfoPlatform()));
+}
+
+static void JsInfoBuildDate(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    args.GetReturnValue().Set(v8s(args.GetIsolate(), Ns_InfoBuildDate()));
+}
+
 /* -----------------------------------------------------------------------
  * ns.time / ns.time.* callbacks
  * --------------------------------------------------------------------- */
@@ -4251,6 +4263,9 @@ static void BuildGlobalTemplate(v8::Isolate *isolate,
     infoObj->Set(isolate, "address",  v8::FunctionTemplate::New(isolate, JsInfoAddress));
     infoObj->Set(isolate, "pid",          v8::FunctionTemplate::New(isolate, JsInfoPid));
     infoObj->Set(isolate, "serverName",   v8::FunctionTemplate::New(isolate, JsInfoServerName));
+    infoObj->Set(isolate, "boottime",     v8::FunctionTemplate::New(isolate, JsInfoBoottime));
+    infoObj->Set(isolate, "platform",     v8::FunctionTemplate::New(isolate, JsInfoPlatform));
+    infoObj->Set(isolate, "buildDate",    v8::FunctionTemplate::New(isolate, JsInfoBuildDate));
     infoObj->Set(isolate, "locks",        v8::FunctionTemplate::New(isolate, JsInfoLocks));
     infoObj->Set(isolate, "threads",      v8::FunctionTemplate::New(isolate, JsInfoThreads));
     infoObj->Set(isolate, "callbacks",    v8::FunctionTemplate::New(isolate, JsInfoCallbacks));
@@ -4705,9 +4720,22 @@ static int JsRequest(void *arg, Ns_Conn *conn) {
 /* -----------------------------------------------------------------------
  * CompileJsAdp — transform .jsadp source into executable JavaScript
  *
- * Static HTML segments are emitted as ns.conn.write("...") calls.
- * <% code %> blocks are injected verbatim.
+ * Static HTML segments → ns.conn.write("...") calls.
+ * <% code %> blocks   → verbatim JavaScript.
+ * <%= expr %> blocks  → ns.conn.write(String(<expr>)).
  * --------------------------------------------------------------------- */
+
+static void AppendEscapedHtml(std::string &out, const std::string &seg) {
+    out += "ns.conn.write(\"";
+    for (char c : seg) {
+        if      (c == '\\') out += "\\\\";
+        else if (c == '"')  out += "\\\"";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else                out += c;
+    }
+    out += "\");\n";
+}
 
 static std::string CompileJsAdp(const std::string &source) {
     std::string out;
@@ -4719,47 +4747,32 @@ static std::string CompileJsAdp(const std::string &source) {
     while (pos < len) {
         size_t tag = source.find("<%", pos);
         if (tag == std::string::npos) {
-            /* Remaining text is all static HTML */
             std::string seg = source.substr(pos);
-            if (!seg.empty()) {
-                out += "ns.conn.write(\"";
-                for (char c : seg) {
-                    if      (c == '\\') out += "\\\\";
-                    else if (c == '"')  out += "\\\"";
-                    else if (c == '\n') out += "\\n";
-                    else if (c == '\r') out += "\\r";
-                    else                out += c;
-                }
-                out += "\");\n";
-            }
+            if (!seg.empty()) AppendEscapedHtml(out, seg);
             break;
         }
 
-        /* Emit static HTML before the tag */
-        if (tag > pos) {
-            std::string seg = source.substr(pos, tag - pos);
-            out += "ns.conn.write(\"";
-            for (char c : seg) {
-                if      (c == '\\') out += "\\\\";
-                else if (c == '"')  out += "\\\"";
-                else if (c == '\n') out += "\\n";
-                else if (c == '\r') out += "\\r";
-                else                out += c;
-            }
-            out += "\");\n";
-        }
+        if (tag > pos) AppendEscapedHtml(out, source.substr(pos, tag - pos));
 
-        /* Find closing %> */
-        size_t end = source.find("%>", tag + 2);
+        /* Distinguish <%= expr %> from <% code %> */
+        bool isExpr = (tag + 2 < len && source[tag + 2] == '=');
+        size_t codeStart = tag + (isExpr ? 3 : 2);
+
+        size_t end = source.find("%>", codeStart);
         if (end == std::string::npos) {
-            /* Unclosed tag — emit remainder as code */
-            out += source.substr(tag + 2);
+            out += source.substr(codeStart);
             break;
         }
 
-        /* Emit raw code block */
-        out += source.substr(tag + 2, end - (tag + 2));
-        out += "\n";
+        std::string block = source.substr(codeStart, end - codeStart);
+        if (isExpr) {
+            out += "ns.conn.write(String(";
+            out += block;
+            out += "));\n";
+        } else {
+            out += block;
+            out += "\n";
+        }
 
         pos = end + 2;
     }

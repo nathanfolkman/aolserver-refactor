@@ -1,0 +1,3 @@
+<p>before</p>
+<% ns.conn.write("code"); %>
+<p>after</p>

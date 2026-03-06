@@ -10,7 +10,7 @@
  *
  *   Supported file types:
  *     *.js    -- plain JavaScript, executed directly
- *     *.jsadp -- template: static HTML + <% code %> blocks compiled to JS
+ *     *.jsadp -- template: static HTML + <% code %> / <%= expr %> blocks
  *
  *   JavaScript API surface:
  *     ns.conn.*        — request/response (write, getHeader, setHeader, getQuery,
@@ -27,7 +27,12 @@
  *     ns.config()      — config access; .section(name), .sections(),
  *                        ns.configInt(), ns.configBool()
  *     ns.info.*        — server info (version, uptime, pageroot, log, config,
- *                        hostname, address, pid)
+ *                        hostname, address, pid, serverName, boottime,
+ *                        platform, buildDate)
+ *     ns.js.stats.*   — global stats (global, scripts, reset)
+ *     ns.server.*     — thread/conn pool stats (threads, connections, active,
+ *                        queued, waiting, keepalive, pools)
+ *     ns.driver.*     — network drivers (list, query)
  *     ns.time()        — time functions (now, format, httpTime, parseHttpTime,
  *                        gmtime, localtime)
  *     ns.url.*         — URL utilities (encode, decode, parse, toFile)
@@ -84,6 +89,7 @@
 #include <libplatform/libplatform.h>
 
 #include <sys/stat.h>
+#include <dlfcn.h>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -98,6 +104,7 @@
 #include <dirent.h>
 #include <fnmatch.h>
 #include <sys/types.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -150,11 +157,21 @@ struct NsMod {
  * Per-thread V8 state (stored in TLS)
  * --------------------------------------------------------------------- */
 
+/* Per-thread compiled script cache entry */
+struct ScriptCacheEntry {
+    v8::Global<v8::UnboundScript> unbound;
+    time_t                         mtime = 0;
+    off_t                          size  = 0;
+};
+
 struct JsData {
-    v8::Isolate                        *isolate;
-    v8::ArrayBuffer::Allocator         *allocator;
+    v8::Isolate                        *isolate   = nullptr;
+    v8::ArrayBuffer::Allocator         *allocator = nullptr;
     v8::Persistent<v8::ObjectTemplate>  globalTmpl;
-    NsMod                              *modPtr;
+    NsMod                              *modPtr    = nullptr;
+    /* Per-thread compilation cache keyed by absolute file path */
+    std::unordered_map<std::string, ScriptCacheEntry> scriptCache; /* *.js  */
+    std::unordered_map<std::string, ScriptCacheEntry> adpCache;    /* *.jsadp */
 };
 
 /* -----------------------------------------------------------------------
@@ -274,6 +291,27 @@ static Ns_Mutex      js_cp_conn_mx;
 static int           js_cp_conn_count = 0;
 
 /* -----------------------------------------------------------------------
+ * Global JS stats — request/compile/runtime counters, process-wide
+ * NEVER memset this struct — Ns_Mutex has internal state.
+ * --------------------------------------------------------------------- */
+
+struct NsJsGlobalStats {
+    Ns_Mutex lock;
+    long totalRequests;
+    long cacheHits;
+    long cacheMisses;
+    long cacheInvalidations;
+    long totalExecUsec;
+    long totalCompileUsec;
+    long compileErrors;
+    long runtimeErrors;
+    long contextCreations;
+    long totalContextUsec;
+    int  activeIsolates;
+};
+static NsJsGlobalStats js_stats;
+
+/* -----------------------------------------------------------------------
  * Custom ArrayBuffer allocator routing through AOLserver's ns_malloc
  * (which maps to tcmalloc when force-loaded by nsd)
  * --------------------------------------------------------------------- */
@@ -305,6 +343,17 @@ static std::string CompileJsAdp(const std::string &source);
 
 static int JsRequest(void *arg, Ns_Conn *conn);
 static int JsAdpRequest(void *arg, Ns_Conn *conn);
+
+/* Forward declarations for new callbacks defined after BuildGlobalTemplate */
+static void JsMemoryStats(const v8::FunctionCallbackInfo<v8::Value> &args);
+static void JsInfoLocks(const v8::FunctionCallbackInfo<v8::Value> &args);
+static void JsInfoThreads(const v8::FunctionCallbackInfo<v8::Value> &args);
+static void JsInfoCallbacks(const v8::FunctionCallbackInfo<v8::Value> &args);
+static void JsInfoSockcallbacks(const v8::FunctionCallbackInfo<v8::Value> &args);
+static void JsInfoScheduled(const v8::FunctionCallbackInfo<v8::Value> &args);
+static void JsServerUrlStats(const v8::FunctionCallbackInfo<v8::Value> &args);
+static void JsCacheNames(const v8::FunctionCallbackInfo<v8::Value> &args);
+static void JsCacheStatsAll(const v8::FunctionCallbackInfo<v8::Value> &args);
 
 /* -----------------------------------------------------------------------
  * V8 helper: convert v8::String to std::string (UTF-8)
@@ -361,6 +410,21 @@ static void EnsurePlatformInit(void) {
         Ns_MutexInit(&js_set_map_lock);
         js_set_map = new std::unordered_map<int, Ns_Set*>();
 
+        /* Initialize global stats struct — fields are zero from BSS,
+         * but Ns_Mutex must be explicitly initialized. */
+        Ns_MutexInit(&js_stats.lock);
+        js_stats.totalRequests      = 0;
+        js_stats.cacheHits          = 0;
+        js_stats.cacheMisses        = 0;
+        js_stats.cacheInvalidations = 0;
+        js_stats.totalExecUsec      = 0;
+        js_stats.totalCompileUsec   = 0;
+        js_stats.compileErrors      = 0;
+        js_stats.runtimeErrors      = 0;
+        js_stats.contextCreations   = 0;
+        js_stats.totalContextUsec   = 0;
+        js_stats.activeIsolates     = 0;
+
         platform_initialized = 1;
     }
     Ns_MutexUnlock(&platform_lock);
@@ -386,7 +450,7 @@ static void EnsureTlsAlloc(void) {
 static JsData *GetJsData(NsMod *modPtr) {
     JsData *dataPtr = static_cast<JsData *>(Ns_TlsGet(&js_tls));
     if (dataPtr == nullptr) {
-        dataPtr = static_cast<JsData *>(ns_calloc(1, sizeof(JsData)));
+        dataPtr = new JsData();
         dataPtr->modPtr    = modPtr;
         dataPtr->allocator = new NsAllocator();
 
@@ -403,6 +467,11 @@ static JsData *GetJsData(NsMod *modPtr) {
         dataPtr->globalTmpl.Reset(dataPtr->isolate, tmpl);
 
         Ns_TlsSet(&js_tls, dataPtr);
+
+        /* Track live isolate count */
+        Ns_MutexLock(&js_stats.lock);
+        js_stats.activeIsolates++;
+        Ns_MutexUnlock(&js_stats.lock);
     }
     return dataPtr;
 }
@@ -419,10 +488,20 @@ static void DeleteJsData(void *arg) {
         v8::Isolate::Scope isolate_scope(dataPtr->isolate);
         v8::HandleScope    handle_scope(dataPtr->isolate);
         dataPtr->globalTmpl.Reset();
+        /* Release cached UnboundScript handles before isolate is disposed */
+        for (auto &kv : dataPtr->scriptCache) kv.second.unbound.Reset();
+        for (auto &kv : dataPtr->adpCache)    kv.second.unbound.Reset();
+        dataPtr->scriptCache.clear();
+        dataPtr->adpCache.clear();
     }
     dataPtr->isolate->Dispose();
     delete dataPtr->allocator;
-    ns_free(dataPtr);
+    delete dataPtr;
+
+    /* Decrement live isolate count */
+    Ns_MutexLock(&js_stats.lock);
+    if (js_stats.activeIsolates > 0) js_stats.activeIsolates--;
+    Ns_MutexUnlock(&js_stats.lock);
 }
 
 /* -----------------------------------------------------------------------
@@ -1262,6 +1341,287 @@ static void JsInfoServerName(const v8::FunctionCallbackInfo<v8::Value> &args) {
     NsMod *mod = GetMod(args);
     if (mod == nullptr) { args.GetReturnValue().SetNull(); return; }
     args.GetReturnValue().Set(v8s(iso, mod->server));
+}
+
+static void JsInfoBoottime(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    args.GetReturnValue().Set(static_cast<double>(Ns_InfoBootTime()));
+}
+
+static void JsInfoPlatform(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    args.GetReturnValue().Set(v8s(args.GetIsolate(), Ns_InfoPlatform()));
+}
+
+static void JsInfoBuildDate(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    args.GetReturnValue().Set(v8s(args.GetIsolate(), Ns_InfoBuildDate()));
+}
+
+/* -----------------------------------------------------------------------
+ * ns.js.stats callbacks
+ * --------------------------------------------------------------------- */
+
+static void JsStatsGlobal(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    v8::Isolate *iso = args.GetIsolate();
+    v8::Local<v8::Context> ctx = iso->GetCurrentContext();
+
+    /* Copy stats under lock */
+    long totalRequests, cacheHits, cacheMisses, cacheInvalidations;
+    long totalExecUsec, totalCompileUsec, compileErrors, runtimeErrors;
+    long contextCreations, totalContextUsec;
+    int  activeIsolates;
+
+    Ns_MutexLock(&js_stats.lock);
+    totalRequests      = js_stats.totalRequests;
+    cacheHits          = js_stats.cacheHits;
+    cacheMisses        = js_stats.cacheMisses;
+    cacheInvalidations = js_stats.cacheInvalidations;
+    totalExecUsec      = js_stats.totalExecUsec;
+    totalCompileUsec   = js_stats.totalCompileUsec;
+    compileErrors      = js_stats.compileErrors;
+    runtimeErrors      = js_stats.runtimeErrors;
+    contextCreations   = js_stats.contextCreations;
+    totalContextUsec   = js_stats.totalContextUsec;
+    activeIsolates     = js_stats.activeIsolates;
+    Ns_MutexUnlock(&js_stats.lock);
+
+    v8::Local<v8::Object> obj = v8::Object::New(iso);
+    obj->Set(ctx, v8s(iso, "totalRequests"),      v8::Number::New(iso, static_cast<double>(totalRequests))).Check();
+    obj->Set(ctx, v8s(iso, "cacheHits"),          v8::Number::New(iso, static_cast<double>(cacheHits))).Check();
+    obj->Set(ctx, v8s(iso, "cacheMisses"),        v8::Number::New(iso, static_cast<double>(cacheMisses))).Check();
+    obj->Set(ctx, v8s(iso, "cacheInvalidations"), v8::Number::New(iso, static_cast<double>(cacheInvalidations))).Check();
+    obj->Set(ctx, v8s(iso, "totalExecUsec"),      v8::Number::New(iso, static_cast<double>(totalExecUsec))).Check();
+    obj->Set(ctx, v8s(iso, "totalCompileUsec"),   v8::Number::New(iso, static_cast<double>(totalCompileUsec))).Check();
+    obj->Set(ctx, v8s(iso, "compileErrors"),      v8::Number::New(iso, static_cast<double>(compileErrors))).Check();
+    obj->Set(ctx, v8s(iso, "runtimeErrors"),      v8::Number::New(iso, static_cast<double>(runtimeErrors))).Check();
+    obj->Set(ctx, v8s(iso, "contextCreations"),   v8::Number::New(iso, static_cast<double>(contextCreations))).Check();
+    obj->Set(ctx, v8s(iso, "totalContextUsec"),   v8::Number::New(iso, static_cast<double>(totalContextUsec))).Check();
+    obj->Set(ctx, v8s(iso, "activeIsolates"),     v8::Integer::New(iso, activeIsolates)).Check();
+    args.GetReturnValue().Set(obj);
+}
+
+static void JsStatsScripts(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    /* Per-script tracking is a follow-on; return empty array for now */
+    args.GetReturnValue().Set(v8::Array::New(args.GetIsolate(), 0));
+}
+
+static void JsStatsReset(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    Ns_MutexLock(&js_stats.lock);
+    js_stats.totalRequests      = 0;
+    js_stats.cacheHits          = 0;
+    js_stats.cacheMisses        = 0;
+    js_stats.cacheInvalidations = 0;
+    js_stats.totalExecUsec      = 0;
+    js_stats.totalCompileUsec   = 0;
+    js_stats.compileErrors      = 0;
+    js_stats.runtimeErrors      = 0;
+    js_stats.contextCreations   = 0;
+    js_stats.totalContextUsec   = 0;
+    /* activeIsolates is a live count — not reset */
+    Ns_MutexUnlock(&js_stats.lock);
+    args.GetReturnValue().SetUndefined();
+}
+
+/* -----------------------------------------------------------------------
+ * Tcl interp helper — run a command, return result string
+ * Returns empty string on error.
+ * --------------------------------------------------------------------- */
+
+static std::string TclEvalCmd(const char *server, const char *cmd) {
+    Tcl_Interp *interp = Ns_TclAllocateInterp(const_cast<char *>(server));
+    if (interp == nullptr) return "";
+    int rc = Tcl_Eval(interp, const_cast<char *>(cmd));
+    std::string result;
+    if (rc == TCL_OK || rc == TCL_RETURN) {
+        const char *res = Tcl_GetStringResult(interp);
+        if (res != nullptr) result = res;
+    }
+    Ns_TclDeAllocateInterp(interp);
+    return result;
+}
+
+/* Set a single key/value on a JS object.  Value is converted to a number if
+ * possible, otherwise kept as a string. */
+static void SetJsKv(v8::Isolate *iso, v8::Local<v8::Context> ctx,
+                    v8::Local<v8::Object> obj,
+                    const char *key, const char *val) {
+    char *endptr = nullptr;
+    double num = strtod(val, &endptr);
+    if (endptr != val && *endptr == '\0')
+        obj->Set(ctx, v8s(iso, key), v8::Number::New(iso, num)).Check();
+    else
+        obj->Set(ctx, v8s(iso, key), v8s(iso, val)).Check();
+}
+
+/* Parse a Tcl k-v structure into a JS object.
+ *
+ * Handles two formats produced by AOLserver commands:
+ *   Flat:  "k1 v1 k2 v2 ..."        (ns_server connections, etc.)
+ *   Nested: "{k1 v1} {k2 v2} ..."   (ns_server threads)
+ *
+ * For the nested format, each element is itself a 2-element Tcl list.
+ * We detect this by checking if the first element contains a space (i.e., is
+ * itself a list), and parse accordingly.
+ */
+static v8::Local<v8::Object> TclKvListToJsObject(v8::Isolate *iso,
+                                                   const std::string &kvStr) {
+    v8::Local<v8::Context> ctx = iso->GetCurrentContext();
+    v8::Local<v8::Object>  obj = v8::Object::New(iso);
+
+    int argc = 0;
+    char **argv = nullptr;
+    if (Tcl_SplitList(nullptr, nc(kvStr), &argc, &argv) != TCL_OK || argv == nullptr)
+        return obj;
+
+    if (argc == 0) {
+        Tcl_Free(reinterpret_cast<char *>(argv));
+        return obj;
+    }
+
+    /* Check whether the first element is itself a sublist (nested pairs format).
+     * This is the case when it contains a space, e.g. "min 2". */
+    bool nested = (strchr(argv[0], ' ') != nullptr);
+
+    if (nested) {
+        /* Nested format: each argv[i] is "{key value}" — split each element */
+        for (int i = 0; i < argc; i++) {
+            int subargc = 0;
+            char **subargv = nullptr;
+            if (Tcl_SplitList(nullptr, argv[i], &subargc, &subargv) == TCL_OK
+                && subargv != nullptr && subargc >= 2) {
+                SetJsKv(iso, ctx, obj, subargv[0], subargv[1]);
+                Tcl_Free(reinterpret_cast<char *>(subargv));
+            }
+        }
+    } else {
+        /* Flat format: consecutive pairs "k1 v1 k2 v2 ..." */
+        for (int i = 0; i + 1 < argc; i += 2) {
+            SetJsKv(iso, ctx, obj, argv[i], argv[i + 1]);
+        }
+    }
+
+    Tcl_Free(reinterpret_cast<char *>(argv));
+    return obj;
+}
+
+/* -----------------------------------------------------------------------
+ * ns.server.* callbacks — via Tcl interp
+ * --------------------------------------------------------------------- */
+
+static void JsServerThreads(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    NsMod *mod = GetMod(args);
+    if (mod == nullptr) { args.GetReturnValue().SetNull(); return; }
+    std::string result = TclEvalCmd(mod->server, "ns_server threads");
+    args.GetReturnValue().Set(TclKvListToJsObject(args.GetIsolate(), result));
+}
+
+static void JsServerConnections(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    v8::Isolate *iso = args.GetIsolate();
+    NsMod *mod = GetMod(args);
+    if (mod == nullptr) { args.GetReturnValue().SetNull(); return; }
+    std::string result = TclEvalCmd(mod->server, "ns_server connections");
+    char *end = nullptr;
+    double n = strtod(result.c_str(), &end);
+    if (end != result.c_str()) args.GetReturnValue().Set(v8::Number::New(iso, n));
+    else args.GetReturnValue().Set(v8s(iso, result));
+}
+
+static void JsServerActive(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    v8::Isolate *iso = args.GetIsolate();
+    NsMod *mod = GetMod(args);
+    if (mod == nullptr) { args.GetReturnValue().SetNull(); return; }
+    std::string result = TclEvalCmd(mod->server, "ns_server active");
+    /* Return list length (number of active connections) */
+    int argc = 0;
+    char **argv = nullptr;
+    int count = 0;
+    if (Tcl_SplitList(nullptr, nc(result), &argc, &argv) == TCL_OK && argv != nullptr) {
+        count = argc;
+        Tcl_Free(reinterpret_cast<char *>(argv));
+    }
+    args.GetReturnValue().Set(v8::Integer::New(iso, count));
+}
+
+static void JsServerQueued(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    v8::Isolate *iso = args.GetIsolate();
+    NsMod *mod = GetMod(args);
+    if (mod == nullptr) { args.GetReturnValue().SetNull(); return; }
+    std::string result = TclEvalCmd(mod->server, "ns_server queued");
+    char *end = nullptr;
+    double n = strtod(result.c_str(), &end);
+    if (end != result.c_str()) args.GetReturnValue().Set(v8::Number::New(iso, n));
+    else args.GetReturnValue().Set(v8::Integer::New(iso, 0));
+}
+
+static void JsServerWaiting(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    v8::Isolate *iso = args.GetIsolate();
+    NsMod *mod = GetMod(args);
+    if (mod == nullptr) { args.GetReturnValue().SetNull(); return; }
+    std::string result = TclEvalCmd(mod->server, "ns_server waiting");
+    char *end = nullptr;
+    double n = strtod(result.c_str(), &end);
+    if (end != result.c_str()) args.GetReturnValue().Set(v8::Number::New(iso, n));
+    else args.GetReturnValue().Set(v8::Integer::New(iso, 0));
+}
+
+static void JsServerKeepalive(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    v8::Isolate *iso = args.GetIsolate();
+    NsMod *mod = GetMod(args);
+    if (mod == nullptr) { args.GetReturnValue().SetNull(); return; }
+    std::string result = TclEvalCmd(mod->server, "ns_server keepalive");
+    char *end = nullptr;
+    double n = strtod(result.c_str(), &end);
+    if (end != result.c_str()) args.GetReturnValue().Set(v8::Number::New(iso, n));
+    else args.GetReturnValue().Set(v8::Integer::New(iso, 0));
+}
+
+static void JsServerPools(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    v8::Isolate *iso = args.GetIsolate();
+    NsMod *mod = GetMod(args);
+    if (mod == nullptr) { args.GetReturnValue().SetNull(); return; }
+    std::string result = TclEvalCmd(mod->server, "ns_server pools");
+    /* Return as JS array of strings */
+    int argc = 0;
+    char **argv = nullptr;
+    v8::Local<v8::Array> arr = v8::Array::New(iso, 0);
+    v8::Local<v8::Context> ctx = iso->GetCurrentContext();
+    if (Tcl_SplitList(nullptr, nc(result), &argc, &argv) == TCL_OK && argv != nullptr) {
+        for (int i = 0; i < argc; i++) {
+            arr->Set(ctx, static_cast<uint32_t>(i), v8s(iso, argv[i])).Check();
+        }
+        Tcl_Free(reinterpret_cast<char *>(argv));
+    }
+    args.GetReturnValue().Set(arr);
+}
+
+/* -----------------------------------------------------------------------
+ * ns.driver.* callbacks — via Tcl interp
+ * --------------------------------------------------------------------- */
+
+static void JsDriverList(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    v8::Isolate *iso = args.GetIsolate();
+    NsMod *mod = GetMod(args);
+    if (mod == nullptr) { args.GetReturnValue().SetNull(); return; }
+    std::string result = TclEvalCmd(mod->server, "ns_driver list");
+    int argc = 0;
+    char **argv = nullptr;
+    v8::Local<v8::Array> arr = v8::Array::New(iso, 0);
+    v8::Local<v8::Context> ctx = iso->GetCurrentContext();
+    if (Tcl_SplitList(nullptr, nc(result), &argc, &argv) == TCL_OK && argv != nullptr) {
+        for (int i = 0; i < argc; i++) {
+            arr->Set(ctx, static_cast<uint32_t>(i), v8s(iso, argv[i])).Check();
+        }
+        Tcl_Free(reinterpret_cast<char *>(argv));
+    }
+    args.GetReturnValue().Set(arr);
+}
+
+static void JsDriverQuery(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    v8::Isolate *iso = args.GetIsolate();
+    NsMod *mod = GetMod(args);
+    if (mod == nullptr || args.Length() < 1) { args.GetReturnValue().SetNull(); return; }
+    std::string name = V8ToString(iso, args[0]);
+    std::string cmd  = std::string("ns_driver query ") + name;
+    std::string result = TclEvalCmd(mod->server, cmd.c_str());
+    args.GetReturnValue().Set(TclKvListToJsObject(iso, result));
 }
 
 /* -----------------------------------------------------------------------
@@ -3165,10 +3525,9 @@ static void JsCpSessionThread(void *arg) {
 
     /* Build a null-conn JsData so GetMod() works for ns.info etc. */
     JsData jdata;
-    memset(&jdata, 0, sizeof(jdata));
-    jdata.isolate = iso;
+    jdata.isolate   = iso;
     jdata.allocator = alloc;
-    jdata.modPtr = cfg->modPtr;
+    jdata.modPtr    = cfg->modPtr;
 
     NsJsContext jctx;
     memset(&jctx, 0, sizeof(jctx));
@@ -3353,18 +3712,28 @@ static void BuildGlobalTemplate(v8::Isolate *isolate,
     cacheObj->Set(isolate, "unset",   v8::FunctionTemplate::New(isolate, JsCacheUnset));
     cacheObj->Set(isolate, "flush",   v8::FunctionTemplate::New(isolate, JsCacheFlush));
     cacheObj->Set(isolate, "stats",   v8::FunctionTemplate::New(isolate, JsCacheStats));
+    cacheObj->Set(isolate, "names",    v8::FunctionTemplate::New(isolate, JsCacheNames));
+    cacheObj->Set(isolate, "statsAll", v8::FunctionTemplate::New(isolate, JsCacheStatsAll));
 
     /* ---- ns.info ---- */
     v8::Local<v8::ObjectTemplate> infoObj = v8::ObjectTemplate::New(isolate);
-    infoObj->Set(isolate, "version",  v8::FunctionTemplate::New(isolate, JsInfoVersion));
-    infoObj->Set(isolate, "uptime",   v8::FunctionTemplate::New(isolate, JsInfoUptime));
-    infoObj->Set(isolate, "pageroot", v8::FunctionTemplate::New(isolate, JsInfoPageroot));
-    infoObj->Set(isolate, "log",      v8::FunctionTemplate::New(isolate, JsInfoLog));
-    infoObj->Set(isolate, "config",   v8::FunctionTemplate::New(isolate, JsInfoConfig));
-    infoObj->Set(isolate, "hostname", v8::FunctionTemplate::New(isolate, JsInfoHostname));
-    infoObj->Set(isolate, "address",  v8::FunctionTemplate::New(isolate, JsInfoAddress));
-    infoObj->Set(isolate, "pid",        v8::FunctionTemplate::New(isolate, JsInfoPid));
-    infoObj->Set(isolate, "serverName", v8::FunctionTemplate::New(isolate, JsInfoServerName));
+    infoObj->Set(isolate, "version",   v8::FunctionTemplate::New(isolate, JsInfoVersion));
+    infoObj->Set(isolate, "uptime",    v8::FunctionTemplate::New(isolate, JsInfoUptime));
+    infoObj->Set(isolate, "pageroot",  v8::FunctionTemplate::New(isolate, JsInfoPageroot));
+    infoObj->Set(isolate, "log",       v8::FunctionTemplate::New(isolate, JsInfoLog));
+    infoObj->Set(isolate, "config",    v8::FunctionTemplate::New(isolate, JsInfoConfig));
+    infoObj->Set(isolate, "hostname",  v8::FunctionTemplate::New(isolate, JsInfoHostname));
+    infoObj->Set(isolate, "address",   v8::FunctionTemplate::New(isolate, JsInfoAddress));
+    infoObj->Set(isolate, "pid",       v8::FunctionTemplate::New(isolate, JsInfoPid));
+    infoObj->Set(isolate, "serverName",   v8::FunctionTemplate::New(isolate, JsInfoServerName));
+    infoObj->Set(isolate, "boottime",     v8::FunctionTemplate::New(isolate, JsInfoBoottime));
+    infoObj->Set(isolate, "platform",     v8::FunctionTemplate::New(isolate, JsInfoPlatform));
+    infoObj->Set(isolate, "buildDate",    v8::FunctionTemplate::New(isolate, JsInfoBuildDate));
+    infoObj->Set(isolate, "locks",        v8::FunctionTemplate::New(isolate, JsInfoLocks));
+    infoObj->Set(isolate, "threads",      v8::FunctionTemplate::New(isolate, JsInfoThreads));
+    infoObj->Set(isolate, "callbacks",    v8::FunctionTemplate::New(isolate, JsInfoCallbacks));
+    infoObj->Set(isolate, "sockcallbacks",v8::FunctionTemplate::New(isolate, JsInfoSockcallbacks));
+    infoObj->Set(isolate, "scheduled",    v8::FunctionTemplate::New(isolate, JsInfoScheduled));
 
     /* ---- ns.time (callable + sub-properties) ---- */
     v8::Local<v8::FunctionTemplate> timeFn =
@@ -3510,6 +3879,34 @@ static void BuildGlobalTemplate(v8::Isolate *isolate,
     setObj->Set(isolate, "free",     v8::FunctionTemplate::New(isolate, JsSetFree));
     setObj->Set(isolate, "toObject", v8::FunctionTemplate::New(isolate, JsSetToObject));
 
+    /* ---- ns.js.stats ---- */
+    v8::Local<v8::ObjectTemplate> jsStatsObj = v8::ObjectTemplate::New(isolate);
+    jsStatsObj->Set(isolate, "global",  v8::FunctionTemplate::New(isolate, JsStatsGlobal));
+    jsStatsObj->Set(isolate, "scripts", v8::FunctionTemplate::New(isolate, JsStatsScripts));
+    jsStatsObj->Set(isolate, "reset",   v8::FunctionTemplate::New(isolate, JsStatsReset));
+    v8::Local<v8::ObjectTemplate> jsObj = v8::ObjectTemplate::New(isolate);
+    jsObj->Set(isolate, "stats", jsStatsObj);
+
+    /* ---- ns.server ---- */
+    v8::Local<v8::ObjectTemplate> serverObj = v8::ObjectTemplate::New(isolate);
+    serverObj->Set(isolate, "threads",     v8::FunctionTemplate::New(isolate, JsServerThreads));
+    serverObj->Set(isolate, "connections", v8::FunctionTemplate::New(isolate, JsServerConnections));
+    serverObj->Set(isolate, "active",      v8::FunctionTemplate::New(isolate, JsServerActive));
+    serverObj->Set(isolate, "queued",      v8::FunctionTemplate::New(isolate, JsServerQueued));
+    serverObj->Set(isolate, "waiting",     v8::FunctionTemplate::New(isolate, JsServerWaiting));
+    serverObj->Set(isolate, "keepalive",   v8::FunctionTemplate::New(isolate, JsServerKeepalive));
+    serverObj->Set(isolate, "pools",       v8::FunctionTemplate::New(isolate, JsServerPools));
+    serverObj->Set(isolate, "urlstats",    v8::FunctionTemplate::New(isolate, JsServerUrlStats));
+
+    /* ---- ns.driver ---- */
+    v8::Local<v8::ObjectTemplate> driverObj = v8::ObjectTemplate::New(isolate);
+    driverObj->Set(isolate, "list",  v8::FunctionTemplate::New(isolate, JsDriverList));
+    driverObj->Set(isolate, "query", v8::FunctionTemplate::New(isolate, JsDriverQuery));
+
+    /* ---- ns.memory ---- */
+    v8::Local<v8::ObjectTemplate> memObj = v8::ObjectTemplate::New(isolate);
+    memObj->Set(isolate, "stats", v8::FunctionTemplate::New(isolate, JsMemoryStats));
+
     /* ---- ns.log (callable fn with sub-properties) ---- */
     v8::Local<v8::FunctionTemplate> logFn = v8::FunctionTemplate::New(isolate, JsLog);
     logFn->Set(isolate, "roll", v8::FunctionTemplate::New(isolate, JsLogRoll));
@@ -3525,6 +3922,10 @@ static void BuildGlobalTemplate(v8::Isolate *isolate,
     nsObj->Set(isolate, "shared",     sharedObj);
     nsObj->Set(isolate, "cache",      cacheObj);
     nsObj->Set(isolate, "info",       infoObj);
+    nsObj->Set(isolate, "js",         jsObj);
+    nsObj->Set(isolate, "server",     serverObj);
+    nsObj->Set(isolate, "driver",     driverObj);
+    nsObj->Set(isolate, "memory",     memObj);
     nsObj->Set(isolate, "url",        urlObj);
     nsObj->Set(isolate, "html",       htmlObj);
     nsObj->Set(isolate, "file",       fileObj);
@@ -3556,35 +3957,53 @@ static void BuildGlobalTemplate(v8::Isolate *isolate,
 }
 
 /* -----------------------------------------------------------------------
- * RunScript — compile and execute a JavaScript string inside ctx
+ * Microsecond wall-clock helper
  * --------------------------------------------------------------------- */
 
-static int RunScript(NsJsContext *ctx, const std::string &source,
-                     const std::string &filename) {
-    v8::Isolate *iso = ctx->dataPtr->isolate;
+static long UsecNow(void) {
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    return static_cast<long>(tv.tv_sec) * 1000000L + static_cast<long>(tv.tv_usec);
+}
 
-    v8::TryCatch   trycatch(iso);
-    v8::Local<v8::Context> v8ctx = iso->GetCurrentContext();
-
+/* -----------------------------------------------------------------------
+ * CompileToUnbound — compile JS source to an UnboundScript (no run)
+ * Returns empty MaybeLocal on compile error; caller logs error.
+ * --------------------------------------------------------------------- */
+static v8::MaybeLocal<v8::UnboundScript>
+CompileToUnbound(v8::Isolate *iso,
+                 const std::string &source,
+                 const std::string &filename) {
+    v8::TryCatch trycatch(iso);
     v8::Local<v8::String> src =
         v8::String::NewFromUtf8(iso, source.c_str(),
                                 v8::NewStringType::kNormal,
                                 static_cast<int>(source.size()))
             .ToLocalChecked();
-
     v8::Local<v8::String> fname =
         v8::String::NewFromUtf8(iso, filename.c_str()).ToLocalChecked();
-    v8::ScriptOrigin origin(fname);  /* V8 14+ dropped the Isolate* arg */
-
-    v8::Local<v8::Script> script;
-    if (!v8::Script::Compile(v8ctx, src, &origin).ToLocal(&script)) {
+    v8::ScriptOrigin origin(fname);
+    v8::ScriptCompiler::Source compSrc(src, origin);
+    v8::Local<v8::UnboundScript> unbound;
+    if (!v8::ScriptCompiler::CompileUnboundScript(iso, &compSrc).ToLocal(&unbound)) {
         v8::String::Utf8Value err(iso, trycatch.Exception());
         Ns_Log(Error, nc("nsjs: compile error in %s: %s"),
                filename.c_str(), *err ? *err : "(unknown)");
-        if (!ctx->responseSent) Ns_ConnReturnInternalError(ctx->conn);
-        return NS_ERROR;
+        return v8::MaybeLocal<v8::UnboundScript>();
     }
+    return unbound;
+}
 
+/* -----------------------------------------------------------------------
+ * RunUnbound — bind a compiled UnboundScript to current context and run
+ * --------------------------------------------------------------------- */
+static int RunUnbound(NsJsContext *ctx,
+                      v8::Local<v8::UnboundScript> unbound,
+                      const std::string &filename) {
+    v8::Isolate *iso = ctx->dataPtr->isolate;
+    v8::TryCatch trycatch(iso);
+    v8::Local<v8::Context> v8ctx = iso->GetCurrentContext();
+    v8::Local<v8::Script> script = unbound->BindToCurrentContext();
     v8::Local<v8::Value> result;
     if (!script->Run(v8ctx).ToLocal(&result)) {
         v8::String::Utf8Value err(iso, trycatch.Exception());
@@ -3593,8 +4012,391 @@ static int RunScript(NsJsContext *ctx, const std::string &source,
         if (!ctx->responseSent) Ns_ConnReturnInternalError(ctx->conn);
         return NS_ERROR;
     }
-
     return NS_OK;
+}
+
+/* -----------------------------------------------------------------------
+ * ns.memory.stats() — tcmalloc heap statistics via dlsym
+ * Falls back to {available:false} when tcmalloc is not loaded.
+ * --------------------------------------------------------------------- */
+static void JsMemoryStats(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    typedef int (*GetPropFn)(const char *, size_t *);
+    static GetPropFn get_prop = nullptr;
+    static int       looked_up = 0;
+    if (!looked_up) {
+        looked_up  = 1;
+        get_prop   = reinterpret_cast<GetPropFn>(
+            dlsym(RTLD_DEFAULT, "MallocExtension_GetNumericProperty"));
+    }
+
+    v8::Isolate *iso = args.GetIsolate();
+    v8::Local<v8::Context> ctx = iso->GetCurrentContext();
+    v8::Local<v8::Object> obj  = v8::Object::New(iso);
+
+    obj->Set(ctx, v8s(iso, "available"),
+             v8::Boolean::New(iso, get_prop != nullptr)).Check();
+
+    if (get_prop) {
+        static const char *props[] = {
+            "generic.current_allocated_bytes",
+            "generic.heap_size",
+            "tcmalloc.pageheap_free_bytes",
+            "tcmalloc.pageheap_unmapped_bytes",
+            "tcmalloc.max_total_thread_cache_bytes",
+            "tcmalloc.current_total_thread_cache_bytes",
+            "tcmalloc.central_cache_free_bytes",
+            "tcmalloc.transfer_cache_free_bytes",
+            "tcmalloc.thread_cache_free_bytes",
+            nullptr
+        };
+        for (int i = 0; props[i]; i++) {
+            size_t val = 0;
+            if (get_prop(props[i], &val)) {
+                obj->Set(ctx, v8s(iso, props[i]),
+                         v8::Number::New(iso, static_cast<double>(val))).Check();
+            }
+        }
+    }
+    args.GetReturnValue().Set(obj);
+}
+
+/* -----------------------------------------------------------------------
+ * ns.info.locks() — returns array of lock info objects
+ * Each element: {name, owner, id, nlock, nbusy}
+ * --------------------------------------------------------------------- */
+static void JsInfoLocks(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    NsJsContext *ctx = GetCtx(args);
+    if (!ctx) { args.GetReturnValue().SetNull(); return; }
+    NsMod *mod = ctx->dataPtr->modPtr;
+    v8::Isolate *iso = args.GetIsolate();
+    v8::Local<v8::Context> v8ctx = iso->GetCurrentContext();
+    v8::Local<v8::Array> arr = v8::Array::New(iso);
+
+    std::string result = TclEvalCmd(mod->server, "ns_info locks");
+    if (result.empty()) { args.GetReturnValue().Set(arr); return; }
+
+    Tcl_Interp *interp = Ns_TclAllocateInterp(mod->server);
+    char **outer = nullptr; int outerCount = 0;
+    if (Tcl_SplitList(interp, nc(result), &outerCount, &outer) == TCL_OK) {
+        uint32_t idx = 0;
+        for (int i = 0; i < outerCount; i++) {
+            char **inner = nullptr; int innerCount = 0;
+            if (Tcl_SplitList(interp, outer[i], &innerCount, &inner) == TCL_OK
+                && innerCount >= 5) {
+                v8::Local<v8::Object> obj = v8::Object::New(iso);
+                obj->Set(v8ctx, v8s(iso,"name"),  v8s(iso, inner[0])).Check();
+                obj->Set(v8ctx, v8s(iso,"owner"), v8s(iso, inner[1])).Check();
+                obj->Set(v8ctx, v8s(iso,"id"),    v8s(iso, inner[2])).Check();
+                obj->Set(v8ctx, v8s(iso,"nlock"), v8::Number::New(iso, atof(inner[3]))).Check();
+                obj->Set(v8ctx, v8s(iso,"nbusy"), v8::Number::New(iso, atof(inner[4]))).Check();
+                arr->Set(v8ctx, idx++, obj).Check();
+            }
+            if (inner) Tcl_Free(reinterpret_cast<char *>(inner));
+        }
+        Tcl_Free(reinterpret_cast<char *>(outer));
+    }
+    Ns_TclDeAllocateInterp(interp);
+    args.GetReturnValue().Set(arr);
+}
+
+/* -----------------------------------------------------------------------
+ * ns.info.threads() — returns array of thread info objects
+ * Each element: {name, parent, tid, flags, ctime, proc, arg}
+ * --------------------------------------------------------------------- */
+static void JsInfoThreads(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    NsJsContext *ctx = GetCtx(args);
+    if (!ctx) { args.GetReturnValue().SetNull(); return; }
+    NsMod *mod = ctx->dataPtr->modPtr;
+    v8::Isolate *iso = args.GetIsolate();
+    v8::Local<v8::Context> v8ctx = iso->GetCurrentContext();
+    v8::Local<v8::Array> arr = v8::Array::New(iso);
+
+    std::string result = TclEvalCmd(mod->server, "ns_info threads");
+    if (result.empty()) { args.GetReturnValue().Set(arr); return; }
+
+    Tcl_Interp *interp = Ns_TclAllocateInterp(mod->server);
+    char **outer = nullptr; int outerCount = 0;
+    if (Tcl_SplitList(interp, nc(result), &outerCount, &outer) == TCL_OK) {
+        uint32_t idx = 0;
+        for (int i = 0; i < outerCount; i++) {
+            char **inner = nullptr; int innerCount = 0;
+            if (Tcl_SplitList(interp, outer[i], &innerCount, &inner) == TCL_OK
+                && innerCount >= 7) {
+                v8::Local<v8::Object> obj = v8::Object::New(iso);
+                obj->Set(v8ctx, v8s(iso,"name"),   v8s(iso, inner[0])).Check();
+                obj->Set(v8ctx, v8s(iso,"parent"), v8s(iso, inner[1])).Check();
+                obj->Set(v8ctx, v8s(iso,"tid"),    v8s(iso, inner[2])).Check();
+                obj->Set(v8ctx, v8s(iso,"flags"),  v8::Number::New(iso, atof(inner[3]))).Check();
+                obj->Set(v8ctx, v8s(iso,"ctime"),  v8::Number::New(iso, atof(inner[4]))).Check();
+                obj->Set(v8ctx, v8s(iso,"proc"),   v8s(iso, inner[5])).Check();
+                obj->Set(v8ctx, v8s(iso,"arg"),    v8s(iso, inner[6])).Check();
+                arr->Set(v8ctx, idx++, obj).Check();
+            }
+            if (inner) Tcl_Free(reinterpret_cast<char *>(inner));
+        }
+        Tcl_Free(reinterpret_cast<char *>(outer));
+    }
+    Ns_TclDeAllocateInterp(interp);
+    args.GetReturnValue().Set(arr);
+}
+
+/* -----------------------------------------------------------------------
+ * ns.info.callbacks() — returns array of {event, name, arg}
+ * --------------------------------------------------------------------- */
+static void JsInfoCallbacks(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    NsJsContext *ctx = GetCtx(args);
+    if (!ctx) { args.GetReturnValue().SetNull(); return; }
+    NsMod *mod = ctx->dataPtr->modPtr;
+    v8::Isolate *iso = args.GetIsolate();
+    v8::Local<v8::Context> v8ctx = iso->GetCurrentContext();
+    v8::Local<v8::Array> arr = v8::Array::New(iso);
+
+    std::string result = TclEvalCmd(mod->server, "ns_info callbacks");
+    if (result.empty()) { args.GetReturnValue().Set(arr); return; }
+
+    Tcl_Interp *interp = Ns_TclAllocateInterp(mod->server);
+    char **outer = nullptr; int outerCount = 0;
+    if (Tcl_SplitList(interp, nc(result), &outerCount, &outer) == TCL_OK) {
+        uint32_t idx = 0;
+        for (int i = 0; i < outerCount; i++) {
+            char **inner = nullptr; int innerCount = 0;
+            if (Tcl_SplitList(interp, outer[i], &innerCount, &inner) == TCL_OK
+                && innerCount >= 3) {
+                v8::Local<v8::Object> obj = v8::Object::New(iso);
+                obj->Set(v8ctx, v8s(iso,"event"), v8s(iso, inner[0])).Check();
+                obj->Set(v8ctx, v8s(iso,"name"),  v8s(iso, inner[1])).Check();
+                obj->Set(v8ctx, v8s(iso,"arg"),   v8s(iso, inner[2])).Check();
+                arr->Set(v8ctx, idx++, obj).Check();
+            }
+            if (inner) Tcl_Free(reinterpret_cast<char *>(inner));
+        }
+        Tcl_Free(reinterpret_cast<char *>(outer));
+    }
+    Ns_TclDeAllocateInterp(interp);
+    args.GetReturnValue().Set(arr);
+}
+
+/* -----------------------------------------------------------------------
+ * ns.info.sockcallbacks() — returns array of {sock, when, proc, arg}
+ * --------------------------------------------------------------------- */
+static void JsInfoSockcallbacks(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    NsJsContext *ctx = GetCtx(args);
+    if (!ctx) { args.GetReturnValue().SetNull(); return; }
+    NsMod *mod = ctx->dataPtr->modPtr;
+    v8::Isolate *iso = args.GetIsolate();
+    v8::Local<v8::Context> v8ctx = iso->GetCurrentContext();
+    v8::Local<v8::Array> arr = v8::Array::New(iso);
+
+    std::string result = TclEvalCmd(mod->server, "ns_info sockcallbacks");
+    if (result.empty()) { args.GetReturnValue().Set(arr); return; }
+
+    Tcl_Interp *interp = Ns_TclAllocateInterp(mod->server);
+    char **outer = nullptr; int outerCount = 0;
+    if (Tcl_SplitList(interp, nc(result), &outerCount, &outer) == TCL_OK) {
+        uint32_t idx = 0;
+        for (int i = 0; i < outerCount; i++) {
+            char **inner = nullptr; int innerCount = 0;
+            if (Tcl_SplitList(interp, outer[i], &innerCount, &inner) == TCL_OK
+                && innerCount >= 4) {
+                v8::Local<v8::Object> obj = v8::Object::New(iso);
+                obj->Set(v8ctx, v8s(iso,"sock"), v8s(iso, inner[0])).Check();
+                obj->Set(v8ctx, v8s(iso,"when"), v8s(iso, inner[1])).Check();
+                obj->Set(v8ctx, v8s(iso,"proc"), v8s(iso, inner[2])).Check();
+                obj->Set(v8ctx, v8s(iso,"arg"),  v8s(iso, inner[3])).Check();
+                arr->Set(v8ctx, idx++, obj).Check();
+            }
+            if (inner) Tcl_Free(reinterpret_cast<char *>(inner));
+        }
+        Tcl_Free(reinterpret_cast<char *>(outer));
+    }
+    Ns_TclDeAllocateInterp(interp);
+    args.GetReturnValue().Set(arr);
+}
+
+/* -----------------------------------------------------------------------
+ * ns.info.scheduled() — returns array of scheduled procedure objects
+ * Each element: {id, flags, interval, nextqueue, lastqueue, laststart,
+ *                lastend, proc, arg}
+ * --------------------------------------------------------------------- */
+static void JsInfoScheduled(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    NsJsContext *ctx = GetCtx(args);
+    if (!ctx) { args.GetReturnValue().SetNull(); return; }
+    NsMod *mod = ctx->dataPtr->modPtr;
+    v8::Isolate *iso = args.GetIsolate();
+    v8::Local<v8::Context> v8ctx = iso->GetCurrentContext();
+    v8::Local<v8::Array> arr = v8::Array::New(iso);
+
+    std::string result = TclEvalCmd(mod->server, "ns_info scheduled");
+    if (result.empty()) { args.GetReturnValue().Set(arr); return; }
+
+    Tcl_Interp *interp = Ns_TclAllocateInterp(mod->server);
+    char **outer = nullptr; int outerCount = 0;
+    if (Tcl_SplitList(interp, nc(result), &outerCount, &outer) == TCL_OK) {
+        uint32_t idx = 0;
+        for (int i = 0; i < outerCount; i++) {
+            char **inner = nullptr; int innerCount = 0;
+            if (Tcl_SplitList(interp, outer[i], &innerCount, &inner) == TCL_OK
+                && innerCount >= 9) {
+                v8::Local<v8::Object> obj = v8::Object::New(iso);
+                obj->Set(v8ctx, v8s(iso,"id"),        v8::Number::New(iso, atof(inner[0]))).Check();
+                obj->Set(v8ctx, v8s(iso,"flags"),     v8::Number::New(iso, atof(inner[1]))).Check();
+                obj->Set(v8ctx, v8s(iso,"interval"),  v8::Number::New(iso, atof(inner[2]))).Check();
+                obj->Set(v8ctx, v8s(iso,"nextqueue"), v8::Number::New(iso, atof(inner[3]))).Check();
+                obj->Set(v8ctx, v8s(iso,"lastqueue"), v8::Number::New(iso, atof(inner[4]))).Check();
+                obj->Set(v8ctx, v8s(iso,"laststart"), v8::Number::New(iso, atof(inner[5]))).Check();
+                obj->Set(v8ctx, v8s(iso,"lastend"),   v8::Number::New(iso, atof(inner[6]))).Check();
+                obj->Set(v8ctx, v8s(iso,"proc"),      v8s(iso, inner[7])).Check();
+                obj->Set(v8ctx, v8s(iso,"arg"),       v8s(iso, inner[8])).Check();
+                arr->Set(v8ctx, idx++, obj).Check();
+            }
+            if (inner) Tcl_Free(reinterpret_cast<char *>(inner));
+        }
+        Tcl_Free(reinterpret_cast<char *>(outer));
+    }
+    Ns_TclDeAllocateInterp(interp);
+    args.GetReturnValue().Set(arr);
+}
+
+/* -----------------------------------------------------------------------
+ * ns.server.urlstats() — returns array of URL stat objects
+ * Each element: {url, hits, waitUsec, openUsec, closedUsec}
+ * --------------------------------------------------------------------- */
+static void JsServerUrlStats(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    NsJsContext *ctx = GetCtx(args);
+    if (!ctx) { args.GetReturnValue().SetNull(); return; }
+    NsMod *mod = ctx->dataPtr->modPtr;
+    v8::Isolate *iso = args.GetIsolate();
+    v8::Local<v8::Context> v8ctx = iso->GetCurrentContext();
+    v8::Local<v8::Array> arr = v8::Array::New(iso);
+
+    std::string result = TclEvalCmd(mod->server, "ns_server urlstats");
+    if (result.empty()) { args.GetReturnValue().Set(arr); return; }
+
+    Tcl_Interp *interp = Ns_TclAllocateInterp(mod->server);
+    char **outer = nullptr; int outerCount = 0;
+    if (Tcl_SplitList(interp, nc(result), &outerCount, &outer) == TCL_OK) {
+        uint32_t idx = 0;
+        for (int i = 0; i < outerCount; i++) {
+            char **item = nullptr; int itemCount = 0;
+            if (Tcl_SplitList(interp, outer[i], &itemCount, &item) == TCL_OK
+                && itemCount >= 2) {
+                /* item[0] = url, item[1] = stats-list */
+                char **stats = nullptr; int statsCount = 0;
+                if (Tcl_SplitList(interp, item[1], &statsCount, &stats) == TCL_OK
+                    && statsCount >= 8) {
+                    v8::Local<v8::Object> obj = v8::Object::New(iso);
+                    obj->Set(v8ctx, v8s(iso,"url"),       v8s(iso, item[0])).Check();
+                    obj->Set(v8ctx, v8s(iso,"hits"),      v8::Number::New(iso, atof(stats[0]))).Check();
+                    obj->Set(v8ctx, v8s(iso,"waitUsec"),  v8::Number::New(iso, atof(stats[2]))).Check();
+                    obj->Set(v8ctx, v8s(iso,"openUsec"),  v8::Number::New(iso, atof(stats[4]))).Check();
+                    obj->Set(v8ctx, v8s(iso,"closedUsec"),v8::Number::New(iso, atof(stats[6]))).Check();
+                    arr->Set(v8ctx, idx++, obj).Check();
+                }
+                if (stats) Tcl_Free(reinterpret_cast<char *>(stats));
+            }
+            if (item) Tcl_Free(reinterpret_cast<char *>(item));
+        }
+        Tcl_Free(reinterpret_cast<char *>(outer));
+    }
+    Ns_TclDeAllocateInterp(interp);
+    args.GetReturnValue().Set(arr);
+}
+
+/* -----------------------------------------------------------------------
+ * ns.cache.names() — returns array of all registered cache names
+ * --------------------------------------------------------------------- */
+static void JsCacheNames(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    NsJsContext *ctx = GetCtx(args);
+    if (!ctx) { args.GetReturnValue().SetNull(); return; }
+    NsMod *mod = ctx->dataPtr->modPtr;
+    v8::Isolate *iso = args.GetIsolate();
+    v8::Local<v8::Context> v8ctx = iso->GetCurrentContext();
+    v8::Local<v8::Array> arr = v8::Array::New(iso);
+
+    std::string result = TclEvalCmd(mod->server, "ns_cache_names");
+    if (result.empty()) { args.GetReturnValue().Set(arr); return; }
+
+    Tcl_Interp *interp = Ns_TclAllocateInterp(mod->server);
+    char **names = nullptr; int nameCount = 0;
+    if (Tcl_SplitList(interp, nc(result), &nameCount, &names) == TCL_OK) {
+        for (int i = 0; i < nameCount; i++) {
+            arr->Set(v8ctx, static_cast<uint32_t>(i), v8s(iso, names[i])).Check();
+        }
+        Tcl_Free(reinterpret_cast<char *>(names));
+    }
+    Ns_TclDeAllocateInterp(interp);
+    args.GetReturnValue().Set(arr);
+}
+
+/* -----------------------------------------------------------------------
+ * ns.cache.statsAll() — returns object keyed by cache name with stats
+ * Stats come from ns_cache_stats which works on all AOLserver caches.
+ * Each value: {maxentry, cost, timeout, size, maxsize, hits, misses,
+ *              hitrate, count}  (fields vary by AOLserver version)
+ * --------------------------------------------------------------------- */
+static void JsCacheStatsAll(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    NsJsContext *ctx = GetCtx(args);
+    if (!ctx) { args.GetReturnValue().SetNull(); return; }
+    NsMod *mod = ctx->dataPtr->modPtr;
+    v8::Isolate *iso = args.GetIsolate();
+    v8::Local<v8::Context> v8ctx = iso->GetCurrentContext();
+    v8::Local<v8::Object> result = v8::Object::New(iso);
+
+    std::string names_str = TclEvalCmd(mod->server, "ns_cache_names");
+    if (names_str.empty()) { args.GetReturnValue().Set(result); return; }
+
+    Tcl_Interp *interp = Ns_TclAllocateInterp(mod->server);
+    char **names = nullptr; int nameCount = 0;
+    if (Tcl_SplitList(interp, nc(names_str), &nameCount, &names) == TCL_OK) {
+        for (int i = 0; i < nameCount; i++) {
+            std::string cmd = std::string("ns_cache_stats ") + names[i];
+            std::string stats_str = TclEvalCmd(mod->server, cmd.c_str());
+
+            v8::Local<v8::Object> sobj = v8::Object::New(iso);
+            char **kv = nullptr; int kvCount = 0;
+            if (!stats_str.empty()
+                && Tcl_SplitList(interp, nc(stats_str), &kvCount, &kv) == TCL_OK) {
+                /* Result is flat "k v k v ..." */
+                for (int j = 0; j + 1 < kvCount; j += 2) {
+                    /* Strip trailing colon from key (ns_cache_stats format) */
+                    std::string key(kv[j]);
+                    if (!key.empty() && key.back() == ':') key.pop_back();
+                    /* Try numeric, fall back to string */
+                    char *end = nullptr;
+                    double dv = strtod(kv[j + 1], &end);
+                    if (end && *end == '\0') {
+                        sobj->Set(v8ctx, v8s(iso, key),
+                                  v8::Number::New(iso, dv)).Check();
+                    } else {
+                        sobj->Set(v8ctx, v8s(iso, key),
+                                  v8s(iso, kv[j + 1])).Check();
+                    }
+                }
+                Tcl_Free(reinterpret_cast<char *>(kv));
+            }
+            result->Set(v8ctx, v8s(iso, names[i]), sobj).Check();
+        }
+        Tcl_Free(reinterpret_cast<char *>(names));
+    }
+    Ns_TclDeAllocateInterp(interp);
+    args.GetReturnValue().Set(result);
+}
+
+/* -----------------------------------------------------------------------
+ * RunScript — compile and execute a JavaScript string inside ctx
+ * (used by jscp REPL; request handlers use the cache path instead)
+ * --------------------------------------------------------------------- */
+
+static int RunScript(NsJsContext *ctx, const std::string &source,
+                     const std::string &filename) {
+    v8::Isolate *iso = ctx->dataPtr->isolate;
+    v8::Local<v8::UnboundScript> unbound;
+    if (!CompileToUnbound(iso, source, filename).ToLocal(&unbound)) {
+        /* CompileToUnbound already logged the error */
+        if (!ctx->responseSent) Ns_ConnReturnInternalError(ctx->conn);
+        return NS_ERROR;
+    }
+    return RunUnbound(ctx, unbound, filename);
 }
 
 /* -----------------------------------------------------------------------
@@ -3620,15 +4422,8 @@ static int JsRequest(void *arg, Ns_Conn *conn) {
         return Ns_ConnReturnNotFound(conn);
     }
 
-    /* Read file */
-    std::ifstream ifs(path.string);
+    std::string filePath(path.string);
     Ns_DStringFree(&path);
-    if (!ifs) {
-        return Ns_ConnReturnInternalError(conn);
-    }
-    std::ostringstream ss;
-    ss << ifs.rdbuf();
-    std::string source = ss.str();
 
     /* Set up per-request context */
     NsJsContext ctx;
@@ -3641,18 +4436,68 @@ static int JsRequest(void *arg, Ns_Conn *conn) {
     v8::Isolate::Scope  isolate_scope(iso);
     v8::HandleScope     handle_scope(iso);
 
+    long ctxStart = UsecNow();
     v8::Local<v8::ObjectTemplate> tmpl =
         v8::Local<v8::ObjectTemplate>::New(iso, dataPtr->globalTmpl);
-    v8::Local<v8::Context> v8ctx =
-        v8::Context::New(iso, nullptr, tmpl);
-
-    /* Store NsJsContext pointer in embedder data slot 0 */
+    v8::Local<v8::Context> v8ctx = v8::Context::New(iso, nullptr, tmpl);
     v8ctx->SetEmbedderData(0, v8::External::New(iso, &ctx));
-
     v8::Context::Scope ctx_scope(v8ctx);
+    long ctxUsec = UsecNow() - ctxStart;
+
+    /* Script cache lookup */
+    bool hit = false, invalidated = false, compileOk = true;
+    v8::Local<v8::UnboundScript> unbound;
+    auto it = dataPtr->scriptCache.find(filePath);
+    if (it != dataPtr->scriptCache.end() &&
+        it->second.mtime == st.st_mtime && it->second.size == st.st_size) {
+        unbound = it->second.unbound.Get(iso);
+        hit = true;
+    } else {
+        if (it != dataPtr->scriptCache.end()) invalidated = true;
+        std::ifstream ifs(filePath);
+        if (!ifs) {
+            Ns_DStringFree(&ctx.output);
+            return Ns_ConnReturnInternalError(conn);
+        }
+        std::ostringstream ss;
+        ss << ifs.rdbuf();
+        if (!CompileToUnbound(iso, ss.str(), conn->request->url).ToLocal(&unbound)) {
+            compileOk = false;
+        } else {
+            auto &entry = dataPtr->scriptCache[filePath];
+            entry.unbound.Reset(iso, unbound);
+            entry.mtime = st.st_mtime;
+            entry.size  = st.st_size;
+        }
+    }
+
+    /* Update cache stats */
+    Ns_MutexLock(&js_stats.lock);
+    if (hit)            js_stats.cacheHits++;
+    else if (!compileOk) js_stats.compileErrors++;
+    else                js_stats.cacheMisses++;
+    if (invalidated)    js_stats.cacheInvalidations++;
+    Ns_MutexUnlock(&js_stats.lock);
+
+    if (!compileOk) {
+        Ns_DStringFree(&ctx.output);
+        Ns_ConnReturnInternalError(conn);
+        return NS_ERROR;
+    }
 
     std::string filename(conn->request->url);
-    int rc = RunScript(&ctx, source, filename);
+    long execStart = UsecNow();
+    int rc = RunUnbound(&ctx, unbound, filename);
+    long execUsec = UsecNow() - execStart;
+
+    /* Update global stats */
+    Ns_MutexLock(&js_stats.lock);
+    js_stats.totalRequests++;
+    js_stats.contextCreations++;
+    js_stats.totalContextUsec += ctxUsec;
+    js_stats.totalExecUsec    += execUsec;
+    if (rc != NS_OK) js_stats.runtimeErrors++;
+    Ns_MutexUnlock(&js_stats.lock);
 
     if (rc == NS_OK && !ctx.responseSent) {
         Ns_ConnReturnHtml(conn, 200,
@@ -3668,8 +4513,21 @@ static int JsRequest(void *arg, Ns_Conn *conn) {
  * CompileJsAdp — transform .jsadp source into executable JavaScript
  *
  * Static HTML segments are emitted as ns.conn.write("...") calls.
- * <% code %> blocks are injected verbatim.
+ * <% code %>  — code block injected verbatim
+ * <%= expr %> — expression block: emits ns.conn.write(String(expr))
  * --------------------------------------------------------------------- */
+
+static void AppendEscapedHtml(std::string &out, const std::string &seg) {
+    out += "ns.conn.write(\"";
+    for (char c : seg) {
+        if      (c == '\\') out += "\\\\";
+        else if (c == '"')  out += "\\\"";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else                out += c;
+    }
+    out += "\");\n";
+}
 
 static std::string CompileJsAdp(const std::string &source) {
     std::string out;
@@ -3683,45 +4541,36 @@ static std::string CompileJsAdp(const std::string &source) {
         if (tag == std::string::npos) {
             /* Remaining text is all static HTML */
             std::string seg = source.substr(pos);
-            if (!seg.empty()) {
-                out += "ns.conn.write(\"";
-                for (char c : seg) {
-                    if      (c == '\\') out += "\\\\";
-                    else if (c == '"')  out += "\\\"";
-                    else if (c == '\n') out += "\\n";
-                    else if (c == '\r') out += "\\r";
-                    else                out += c;
-                }
-                out += "\");\n";
-            }
+            if (!seg.empty()) AppendEscapedHtml(out, seg);
             break;
         }
 
         /* Emit static HTML before the tag */
-        if (tag > pos) {
-            std::string seg = source.substr(pos, tag - pos);
-            out += "ns.conn.write(\"";
-            for (char c : seg) {
-                if      (c == '\\') out += "\\\\";
-                else if (c == '"')  out += "\\\"";
-                else if (c == '\n') out += "\\n";
-                else if (c == '\r') out += "\\r";
-                else                out += c;
-            }
-            out += "\");\n";
-        }
+        if (tag > pos) AppendEscapedHtml(out, source.substr(pos, tag - pos));
+
+        /* Distinguish <%= expr %> from <% code %> */
+        bool isExpr = (tag + 2 < len && source[tag + 2] == '=');
+        size_t codeStart = tag + (isExpr ? 3 : 2);
 
         /* Find closing %> */
-        size_t end = source.find("%>", tag + 2);
+        size_t end = source.find("%>", codeStart);
         if (end == std::string::npos) {
             /* Unclosed tag — emit remainder as code */
-            out += source.substr(tag + 2);
+            out += source.substr(codeStart);
             break;
         }
 
-        /* Emit raw code block */
-        out += source.substr(tag + 2, end - (tag + 2));
-        out += "\n";
+        std::string block = source.substr(codeStart, end - codeStart);
+        if (isExpr) {
+            /* <%= expr %> → ns.conn.write(String(<expr>)); */
+            out += "ns.conn.write(String(";
+            out += block;
+            out += "));\n";
+        } else {
+            /* <% code %> → verbatim */
+            out += block;
+            out += "\n";
+        }
 
         pos = end + 2;
     }
@@ -3752,16 +4601,8 @@ static int JsAdpRequest(void *arg, Ns_Conn *conn) {
         return Ns_ConnReturnNotFound(conn);
     }
 
-    std::ifstream ifs(path.string);
+    std::string filePath(path.string);
     Ns_DStringFree(&path);
-    if (!ifs) {
-        return Ns_ConnReturnInternalError(conn);
-    }
-    std::ostringstream ss;
-    ss << ifs.rdbuf();
-    std::string adpSource = ss.str();
-
-    std::string jsSource = CompileJsAdp(adpSource);
 
     NsJsContext ctx;
     ctx.dataPtr      = dataPtr;
@@ -3773,16 +4614,69 @@ static int JsAdpRequest(void *arg, Ns_Conn *conn) {
     v8::Isolate::Scope  isolate_scope(iso);
     v8::HandleScope     handle_scope(iso);
 
+    long ctxStart = UsecNow();
     v8::Local<v8::ObjectTemplate> tmpl =
         v8::Local<v8::ObjectTemplate>::New(iso, dataPtr->globalTmpl);
-    v8::Local<v8::Context> v8ctx =
-        v8::Context::New(iso, nullptr, tmpl);
-
+    v8::Local<v8::Context> v8ctx = v8::Context::New(iso, nullptr, tmpl);
     v8ctx->SetEmbedderData(0, v8::External::New(iso, &ctx));
     v8::Context::Scope ctx_scope(v8ctx);
+    long ctxUsec = UsecNow() - ctxStart;
 
+    /* ADP cache lookup — cache the compiled JS source as an UnboundScript */
+    bool hit = false, invalidated = false, compileOk = true;
+    v8::Local<v8::UnboundScript> unbound;
     std::string filename = std::string(conn->request->url) + " [jsadp]";
-    int rc = RunScript(&ctx, jsSource, filename);
+    auto it = dataPtr->adpCache.find(filePath);
+    if (it != dataPtr->adpCache.end() &&
+        it->second.mtime == st.st_mtime && it->second.size == st.st_size) {
+        unbound = it->second.unbound.Get(iso);
+        hit = true;
+    } else {
+        if (it != dataPtr->adpCache.end()) invalidated = true;
+        std::ifstream ifs(filePath);
+        if (!ifs) {
+            Ns_DStringFree(&ctx.output);
+            return Ns_ConnReturnInternalError(conn);
+        }
+        std::ostringstream ss;
+        ss << ifs.rdbuf();
+        std::string jsSource = CompileJsAdp(ss.str());
+        if (!CompileToUnbound(iso, jsSource, filename).ToLocal(&unbound)) {
+            compileOk = false;
+        } else {
+            auto &entry = dataPtr->adpCache[filePath];
+            entry.unbound.Reset(iso, unbound);
+            entry.mtime = st.st_mtime;
+            entry.size  = st.st_size;
+        }
+    }
+
+    /* Update cache stats */
+    Ns_MutexLock(&js_stats.lock);
+    if (hit)             js_stats.cacheHits++;
+    else if (!compileOk) js_stats.compileErrors++;
+    else                 js_stats.cacheMisses++;
+    if (invalidated)     js_stats.cacheInvalidations++;
+    Ns_MutexUnlock(&js_stats.lock);
+
+    if (!compileOk) {
+        Ns_DStringFree(&ctx.output);
+        Ns_ConnReturnInternalError(conn);
+        return NS_ERROR;
+    }
+
+    long execStart = UsecNow();
+    int rc = RunUnbound(&ctx, unbound, filename);
+    long execUsec = UsecNow() - execStart;
+
+    /* Update global stats */
+    Ns_MutexLock(&js_stats.lock);
+    js_stats.totalRequests++;
+    js_stats.contextCreations++;
+    js_stats.totalContextUsec += ctxUsec;
+    js_stats.totalExecUsec    += execUsec;
+    if (rc != NS_OK) js_stats.runtimeErrors++;
+    Ns_MutexUnlock(&js_stats.lock);
 
     if (rc == NS_OK && !ctx.responseSent) {
         Ns_ConnReturnHtml(conn, 200,

@@ -1,0 +1,19 @@
+{
+  "name": "aolserver-stats-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "react": "^18",
+    "react-dom": "^18"
+  },
+  "devDependencies": {
+    "esbuild": "^0.21",
+    "tailwindcss": "^3",
+    "postcss": "^8",
+    "autoprefixer": "^10"
+  },
+  "scripts": {
+    "build": "node build.mjs"
+  }
+}

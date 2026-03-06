@@ -48,3 +48,5 @@ ns_section "ns/server/server1/module/nsjs"
     ns_param jscp_users        "admin:secret"
     ns_param jscp_log          false
     ns_param jscp_max_sessions 5
+    ns_param stats_user        "nsadmin"
+    ns_param stats_password    "changeme"

@@ -43,8 +43,10 @@ ns_section "ns/server/server1/module/nslog"
 set jscp_port [expr {[info exists ::env(NSJS_JSCP_PORT)] ? $::env(NSJS_JSCP_PORT) : 9090}]
 
 ns_section "ns/server/server1/module/nsjs"
-    ns_param jscp_address      127.0.0.1
-    ns_param jscp_port         $jscp_port
-    ns_param jscp_users        "admin:secret"
-    ns_param jscp_log          false
-    ns_param jscp_max_sessions 5
+    ns_param jscp_address         127.0.0.1
+    ns_param jscp_port            $jscp_port
+    ns_param jscp_users           "admin:secret"
+    ns_param jscp_log             false
+    ns_param jscp_max_sessions    5
+    ns_param js_script_cache      true
+    ns_param js_cache_stat_always true

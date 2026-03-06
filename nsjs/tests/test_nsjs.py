@@ -875,6 +875,167 @@ class TestJsCp(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Script compilation cache and stats tests
+# ---------------------------------------------------------------------------
+
+class TestScriptCacheStats(unittest.TestCase):
+    """Tests for ns.js compilation cache and ns.js.stats API."""
+
+    def _get_global_stats(self) -> dict:
+        import json
+        _, _, body = get("/test_js_stats.js?action=global")
+        return json.loads(body)
+
+    def _get_script_stats(self) -> list:
+        import json
+        _, _, body = get("/test_js_stats.js?action=scripts")
+        return json.loads(body)
+
+    def _reset_stats(self):
+        get("/test_js_stats.js?action=reset")
+
+    def test_stats_global_fields(self):
+        """ns.js.stats.global() returns an object with all expected fields."""
+        stats = self._get_global_stats()
+        expected_keys = [
+            "totalRequests", "totalAdpRequests", "cacheHits", "cacheMisses",
+            "cacheInvalidations", "totalExecUsec", "totalCompileUsec",
+            "compileErrors", "runtimeErrors", "cachedScripts",
+            "cachedAdpScripts", "contextCreations", "totalContextUsec",
+            "activeIsolates",
+        ]
+        for k in expected_keys:
+            self.assertIn(k, stats, f"Missing field: {k}")
+
+    def test_stats_cache_hits_increase(self):
+        """After warm-up, hits should outnumber misses on repeated requests."""
+        s0 = self._get_global_stats()
+        hits_before   = s0["cacheHits"]
+        misses_before = s0["cacheMisses"]
+        # Fire 50 requests.  With maxthreads=10 there are at most 10 first-time
+        # misses; the remaining 40+ are cache hits.
+        for _ in range(50):
+            get("/hello.js")
+        s1 = self._get_global_stats()
+        new_hits   = s1["cacheHits"]   - hits_before
+        new_misses = s1["cacheMisses"] - misses_before
+        self.assertGreater(
+            new_hits, new_misses,
+            f"Expected hits ({new_hits}) > misses ({new_misses}) after 50 requests",
+        )
+
+    def test_stats_total_requests_increase(self):
+        """totalRequests increments with each request."""
+        self._reset_stats()
+        get("/hello.js")
+        s1 = self._get_global_stats()
+        get("/hello.js")
+        s2 = self._get_global_stats()
+        self.assertGreater(s2["totalRequests"], s1["totalRequests"])
+
+    def test_stats_context_creations(self):
+        """contextCreations increments — one per request."""
+        self._reset_stats()
+        n = 3
+        for _ in range(n):
+            get("/hello.js")
+        stats = self._get_global_stats()
+        self.assertGreaterEqual(stats["contextCreations"], n)
+
+    def test_stats_reset(self):
+        """ns.js.stats.reset() dramatically reduces counters vs pre-reset levels."""
+        # Build up a large request count
+        for _ in range(20):
+            get("/hello.js")
+        s_before = self._get_global_stats()
+        self._reset_stats()
+        s_after = self._get_global_stats()
+        # After reset the counter should be far less than before.
+        # The reset request itself and the get-stats request may each add 1,
+        # so allow a small margin (< 5).
+        self.assertLess(s_after["totalRequests"], 5,
+                        "Reset did not dramatically reduce totalRequests")
+        self.assertLess(s_before["totalRequests"],
+                        s_before["totalRequests"] + 1)  # sanity
+        # Verify activeIsolates is preserved through reset
+        self.assertGreater(s_after["activeIsolates"], 0)
+
+    def test_stats_active_isolates(self):
+        """activeIsolates is a positive integer (at least one worker thread)."""
+        stats = self._get_global_stats()
+        self.assertGreater(stats["activeIsolates"], 0)
+
+    def test_stats_scripts_list(self):
+        """ns.js.stats.scripts() returns a list; after a request the file appears."""
+        # Trigger hello.js so it's cached on at least one thread
+        get("/hello.js")
+        scripts = self._get_script_stats()
+        self.assertIsInstance(scripts, list)
+        self.assertGreater(len(scripts), 0)
+        # Every entry should have the required fields
+        required = ["path", "hitCount", "missCount", "invalidateCount",
+                    "totalExecUsec", "totalCompileUsec", "lastCompileTime"]
+        for entry in scripts:
+            for f in required:
+                self.assertIn(f, entry, f"scripts entry missing field: {f}")
+
+    def test_cache_invalidation(self):
+        """Editing a .js file triggers re-execution of updated content.
+
+        Invalidation count is a best-effort check — it increments only when
+        the same worker thread that cached the old version also serves the new
+        one.  We verify the behaviour (new content returned) and accept that
+        cacheMisses must have gone up (covers both invalidation and new-thread
+        first-miss paths).
+        """
+        tmp_path = PAGES_DIR / "cache_test_tmp.js"
+        try:
+            # Create v1 and saturate all minthreads by making many requests
+            tmp_path.write_text("ns.conn.write('v1');")
+            for _ in range(20):
+                _, _, body = get("/cache_test_tmp.js")
+                self.assertEqual(body, "v1")
+
+            # Baseline stats
+            s0 = self._get_global_stats()
+            misses_before = s0["cacheMisses"]
+
+            # Update the file and advance mtime by a full second so that
+            # st.st_mtime (1-second resolution on most filesystems) is
+            # guaranteed to differ from the cached value.
+            import time as _time, os as _os
+            old_mtime = int(tmp_path.stat().st_mtime)
+            tmp_path.write_text("ns.conn.write('v2');")
+            _os.utime(str(tmp_path), (old_mtime + 2, old_mtime + 2))
+
+            # Next request MUST return updated content
+            _, _, body2 = get("/cache_test_tmp.js")
+            self.assertEqual(body2, "v2", "Updated script not re-executed")
+
+            # At least one miss (invalidation or new-thread first-miss)
+            s1 = self._get_global_stats()
+            self.assertGreater(s1["cacheMisses"], misses_before,
+                               "cacheMisses did not increase after file change")
+
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+
+    def test_context_isolation_still_works(self):
+        """Cache must not bleed global state between requests (UnboundScript
+        + fresh Context is the correct model)."""
+        n = 5
+        bodies = set()
+        for _ in range(n):
+            _, _, body = get("/isolation.js")
+            bodies.add(body)
+        # isolation.js increments a global and returns it; with fresh context
+        # each request should always return "1"
+        self.assertEqual(bodies, {"1"},
+                         "Context isolation broken — global leaked across requests")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 

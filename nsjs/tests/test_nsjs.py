@@ -398,6 +398,151 @@ class TestJsAdp(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Extended API test suites
+# ---------------------------------------------------------------------------
+
+class TestConnExtended(unittest.TestCase):
+    """Extended ns.conn.* API."""
+
+    def test_all_pass(self):
+        _, _, body = get("/test_conn_extended.js")
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"conn-extended: {token} failed (full body: {body})")
+
+
+class TestSharedExtended(unittest.TestCase):
+    """Extended ns.shared.* API."""
+
+    def test_all_pass(self):
+        _, _, body = get("/test_shared_extended.js")
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"shared-extended: {token} failed (full body: {body})")
+
+
+class TestCacheApi(unittest.TestCase):
+    """ns.cache.* API."""
+
+    def test_all_pass(self):
+        status, _, body = get("/test_cache.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"cache: {token} failed (full body: {body})")
+
+
+class TestConfigApi(unittest.TestCase):
+    """ns.config* API."""
+
+    def test_all_pass(self):
+        status, _, body = get("/test_config.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"config: {token} failed (full body: {body})")
+
+
+class TestInfoApi(unittest.TestCase):
+    """ns.info.* API."""
+
+    def test_all_pass(self):
+        status, _, body = get("/test_info.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"info: {token} failed (full body: {body})")
+
+
+class TestTimeApi(unittest.TestCase):
+    """ns.time* API."""
+
+    def test_all_pass(self):
+        status, _, body = get("/test_time.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"time: {token} failed (full body: {body})")
+
+
+class TestUrlApi(unittest.TestCase):
+    """ns.url.* API."""
+
+    def test_all_pass(self):
+        status, _, body = get("/test_url.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"url: {token} failed (full body: {body})")
+
+
+class TestHtmlApi(unittest.TestCase):
+    """ns.html.* API."""
+
+    def test_all_pass(self):
+        status, _, body = get("/test_html.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"html: {token} failed (full body: {body})")
+
+
+class TestFileApi(unittest.TestCase):
+    """ns.file.* API."""
+
+    def test_all_pass(self):
+        status, _, body = get("/test_file.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"file: {token} failed (full body: {body})")
+
+
+class TestDnsApi(unittest.TestCase):
+    """ns.dns.* API."""
+
+    def test_all_pass(self):
+        status, _, body = get("/test_dns.js")
+        self.assertEqual(status, 200)
+        ok_tokens = [t for t in body.split(",") if t.endswith(":ok")]
+        self.assertGreaterEqual(len(ok_tokens), 2,
+            f"dns: expected at least 2 ok tokens, got: {body}")
+
+
+class TestMutexApi(unittest.TestCase):
+    """ns.mutex.* API."""
+
+    def test_all_pass(self):
+        status, _, body = get("/test_mutex.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"mutex: {token} failed (full body: {body})")
+
+
+class TestRwLockApi(unittest.TestCase):
+    """ns.rwlock.* API."""
+
+    def test_all_pass(self):
+        status, _, body = get("/test_rwlock.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"rwlock: {token} failed (full body: {body})")
+
+
+class TestSchedApi(unittest.TestCase):
+    """ns.sched.* API."""
+
+    def test_all_pass(self):
+        status, _, body = get("/test_sched.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"sched: {token} failed (full body: {body})")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 

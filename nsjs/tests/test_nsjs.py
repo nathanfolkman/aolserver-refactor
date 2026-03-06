@@ -376,6 +376,13 @@ class TestJsAdp(unittest.TestCase):
         self.assertLess(body.index("before"), body.index("code"))
         self.assertLess(body.index("code"),   body.index("after"))
 
+    def test_expr_syntax(self):
+        # expr.jsadp uses <%= expr %> to output computed values
+        _, _, body = get("/expr.jsadp")
+        self.assertIn("result=42",      body)
+        self.assertIn("greeting=HELLO", body)
+        self.assertIn("math=3",         body)
+
     def test_adp_counter_increments(self):
         # Each request to adp-counter.jsadp must return a higher value
         _, _, b1 = get("/adp-counter.jsadp")

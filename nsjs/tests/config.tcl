@@ -50,3 +50,5 @@ ns_section "ns/server/server1/module/nsjs"
     ns_param jscp_max_sessions    5
     ns_param js_script_cache      true
     ns_param js_cache_stat_always true
+    ns_param stats_user           "nsadmin"
+    ns_param stats_password       "changeme"

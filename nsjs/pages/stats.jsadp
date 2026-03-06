@@ -1,0 +1,105 @@
+<%
+/*
+ * stats.jsadp — AOLserver Stats Dashboard
+ *
+ * The client bundle is inlined in the HTML to avoid AOLserver's nsjs handler
+ * intercepting /stats-client-bundle.js and trying to execute it server-side.
+ * The bundle is cached in ns.shared keyed by file mtime.
+ *
+ * Requires Basic Auth. Configure credentials in nsd.tcl:
+ *   ns_section "ns/server/${servername}/module/nsjs"
+ *   ns_param stats_user     "nsadmin"
+ *   ns_param stats_password "changeme"
+ */
+
+/* --- Basic Auth check --- */
+var cfgSection  = "ns/server/" + ns.info.serverName() + "/module/nsjs";
+var cfgUser     = ns.config(cfgSection, "stats_user",     "nsadmin");
+var cfgPass     = ns.config(cfgSection, "stats_password", "");
+
+if (ns.conn.getAuthUser() !== cfgUser || ns.conn.getAuthPasswd() !== cfgPass) {
+    ns.conn.setHeader("WWW-Authenticate", 'Basic realm="AOLserver Stats"');
+    ns.conn.returnHtml(401, "Unauthorized");
+} else {
+
+/* --- Cache client bundle in ns.shared by mtime --- */
+var clientPath = ns.info.pageroot() + "/stats-client-bundle.js";
+var clientStat = ns.file.stat(clientPath);
+var cachedClientMtime = ns.shared.get("__stats_client", "mtime");
+if (!cachedClientMtime || parseInt(cachedClientMtime) !== clientStat.mtime) {
+    ns.shared.set("__stats_client", "src",   ns.file.read(clientPath));
+    ns.shared.set("__stats_client", "mtime", String(clientStat.mtime));
+}
+var clientBundle = ns.shared.get("__stats_client", "src");
+
+/* --- Cache styles in ns.shared by mtime --- */
+var cssPath = ns.info.pageroot() + "/stats-styles.css";
+var cssStat = ns.file.stat(cssPath);
+var cachedCssMtime = ns.shared.get("__stats_css", "mtime");
+if (!cachedCssMtime || parseInt(cachedCssMtime) !== cssStat.mtime) {
+    ns.shared.set("__stats_css", "src",   ns.file.read(cssPath));
+    ns.shared.set("__stats_css", "mtime", String(cssStat.mtime));
+}
+var inlineCss = ns.shared.get("__stats_css", "src");
+
+/* --- Collect stats --- */
+var data = {
+    info: {
+        serverName: ns.info.serverName(),
+        version:    ns.info.version(),
+        uptime:     ns.info.uptime(),
+        boottime:   ns.info.boottime(),
+        pid:        ns.info.pid(),
+        hostname:   ns.info.hostname(),
+        address:    ns.info.address(),
+        pageroot:   ns.info.pageroot(),
+        platform:   ns.info.platform(),
+        buildDate:  ns.info.buildDate(),
+    },
+    jsStats:   ns.js.stats.global(),
+    memory:    ns.memory.stats(),
+    server: {
+        threads:     ns.server.threads(),
+        active:      ns.server.active(),
+        queued:      ns.server.queued(),
+        waiting:     ns.server.waiting(),
+        keepalive:   ns.server.keepalive(),
+        connections: ns.server.connections(),
+        pools:       ns.server.pools(),
+        urlstats:    ns.server.urlstats(),
+    },
+    drivers:   ns.driver.list(),
+    locks:     ns.info.locks(),
+    threads:   ns.info.threads(),
+    scheduled: ns.info.scheduled(),
+    callbacks: ns.info.callbacks(),
+    caches:    (function() {
+        var raw = ns.cache.statsAll();
+        var out = {};
+        for (var name in raw) {
+            var s = raw[name]; var c = {};
+            for (var k in s) { c[k.replace(/:$/, "")] = s[k]; }
+            out[name] = c;
+        }
+        return out;
+    })(),
+};
+%><!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>AOLserver Stats &mdash; <%= data.info.serverName %></title>
+  <style><%= inlineCss %></style>
+</head>
+<body class="bg-background text-foreground">
+  <div id="root">
+    <div class="min-h-screen flex items-center justify-center">
+      <p class="text-muted-foreground">Loading dashboard&hellip;</p>
+    </div>
+  </div>
+  <script>window.__STATS_DATA__=<%= JSON.stringify(data) %>;</script>
+  <script><%= clientBundle %></script>
+</body>
+</html>
+<% } %>

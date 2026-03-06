@@ -1,0 +1,1 @@
+<% var v = ns.shared.incr("adp_counter", "hits", 1); %><% ns.conn.write(String(v)); %>

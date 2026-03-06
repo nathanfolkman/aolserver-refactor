@@ -7,6 +7,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 option(NS_BUILD_DEPS "Download and build Tcl, OpenSSL, gperftools from source" ON)
 option(NS_WITH_SSL "Build nsssl module" ON)
 option(NS_WITH_ZLIB "Build nszlib module" ON)
+option(NS_WITH_V8 "Build nsjs JavaScript module (requires V8)" OFF)
 
 set(CMAKE_INSTALL_PREFIX "/usr/local/aolserver" CACHE PATH "Install prefix")
 
@@ -27,6 +28,8 @@ include(CheckIncludeFile)
 include(cmake/CompilerWarnings.cmake)
 include(cmake/Dependencies.cmake)
 include(cmake/InstallLayout.cmake)
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 
 # Feature checks (replacing autoconf)
 check_function_exists(timegm HAVE_TIMEGM)
@@ -73,4 +76,11 @@ add_subdirectory(nsproxy)
 add_subdirectory(nszlib)
 if(NS_WITH_SSL)
     add_subdirectory(nsssl)
+endif()
+
+if(NS_WITH_V8)
+    enable_language(CXX)
+    find_package(V8 REQUIRED)
+    enable_testing()
+    add_subdirectory(nsjs)
 endif()

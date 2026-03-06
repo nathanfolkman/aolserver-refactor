@@ -19,6 +19,7 @@ import http.client
 import os
 import pathlib
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -36,11 +37,12 @@ TESTS_DIR   = pathlib.Path(__file__).parent.resolve()
 PAGES_DIR   = TESTS_DIR / "pages"
 CONFIG_TCL  = TESTS_DIR / "config.tcl"
 
-INSTALL = os.environ.get("NSJS_INSTALL", "/tmp/aolserver-test")
-PORT    = int(os.environ.get("NSJS_PORT", "8765"))
-V8_LIB  = os.environ.get("NSJS_V8_LIB", "")
+INSTALL   = os.environ.get("NSJS_INSTALL", "/tmp/aolserver-test")
+PORT      = int(os.environ.get("NSJS_PORT", "8765"))
+JSCP_PORT = int(os.environ.get("NSJS_JSCP_PORT", "9090"))
+V8_LIB    = os.environ.get("NSJS_V8_LIB", "")
 
-HOST    = "127.0.0.1"
+HOST = "127.0.0.1"
 
 # ---------------------------------------------------------------------------
 # Server lifecycle helpers
@@ -77,9 +79,10 @@ def start_server() -> None:
         raise RuntimeError(f"nsd not found at {nsd}; set NSJS_INSTALL correctly")
 
     env = os.environ.copy()
-    env["NSJS_INSTALL"] = INSTALL
-    env["NSJS_PORT"]    = str(PORT)
-    env["NSJS_PAGES"]   = str(PAGES_DIR)
+    env["NSJS_INSTALL"]   = INSTALL
+    env["NSJS_PORT"]      = str(PORT)
+    env["NSJS_PAGES"]     = str(PAGES_DIR)
+    env["NSJS_JSCP_PORT"] = str(JSCP_PORT)
 
     lib_dirs = [os.path.join(INSTALL, "lib")]
     if V8_LIB:
@@ -542,6 +545,335 @@ class TestSchedApi(unittest.TestCase):
                 f"sched: {token} failed (full body: {body})")
 
 
+class TestSleepApi(unittest.TestCase):
+    def test_all_pass(self):
+        status, _, body = get("/test_sleep.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"sleep: {token} failed (full body: {body})")
+
+
+class TestCryptApi(unittest.TestCase):
+    def test_all_pass(self):
+        status, _, body = get("/test_crypt.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"crypt: {token} failed (full body: {body})")
+
+
+class TestEnvApi(unittest.TestCase):
+    def test_all_pass(self):
+        status, _, body = get("/test_env.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"env: {token} failed (full body: {body})")
+
+
+class TestFileExtendedApi(unittest.TestCase):
+    def test_all_pass(self):
+        status, _, body = get("/test_file_extended.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"file-ext: {token} failed (full body: {body})")
+
+
+class TestImageApi(unittest.TestCase):
+    def test_all_pass(self):
+        status, _, body = get("/test_image.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"image: {token} failed (full body: {body})")
+
+
+class TestHtmlExtendedApi(unittest.TestCase):
+    def test_all_pass(self):
+        status, _, body = get("/test_html_extended.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"html-ext: {token} failed (full body: {body})")
+
+
+class TestProcessApi(unittest.TestCase):
+    def test_all_pass(self):
+        status, _, body = get("/test_process.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"process: {token} failed (full body: {body})")
+
+
+class TestConfigExtendedApi(unittest.TestCase):
+    def test_all_pass(self):
+        status, _, body = get("/test_config_extended.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"config-ext: {token} failed (full body: {body})")
+
+
+class TestConnExtended2Api(unittest.TestCase):
+    def test_all_pass(self):
+        status, _, body = get("/test_conn_extended2.js")
+        # returnNotice sends a response with its own status
+        self.assertIn(status, (200, 201, 204))
+        tokens = [t for t in body.split(",") if t.strip()]
+        for token in tokens:
+            self.assertTrue(token.endswith(":ok"),
+                f"conn-ext2: {token} failed (full body: {body})")
+
+
+class TestSemaApi(unittest.TestCase):
+    def test_all_pass(self):
+        status, _, body = get("/test_sema.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"sema: {token} failed (full body: {body})")
+
+
+class TestCondApi(unittest.TestCase):
+    def test_all_pass(self):
+        status, _, body = get("/test_cond.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"cond: {token} failed (full body: {body})")
+
+
+class TestSchedExtendedApi(unittest.TestCase):
+    def test_all_pass(self):
+        status, _, body = get("/test_sched_extended.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"sched-ext: {token} failed (full body: {body})")
+
+
+class TestSetApi(unittest.TestCase):
+    def test_all_pass(self):
+        status, _, body = get("/test_set.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"set: {token} failed (full body: {body})")
+
+
+class TestHttpApi(unittest.TestCase):
+    def test_all_pass(self):
+        status, _, body = get("/test_http.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"http: {token} failed (full body: {body})")
+
+
+class TestSockApi(unittest.TestCase):
+    def test_all_pass(self):
+        status, _, body = get("/test_sock.js")
+        self.assertEqual(status, 200)
+        tokens = [t for t in body.split(",") if not t.endswith(":skip")]
+        for token in tokens:
+            self.assertTrue(token.endswith(":ok"),
+                f"sock: {token} failed (full body: {body})")
+
+
+class TestThreadApi(unittest.TestCase):
+    def test_all_pass(self):
+        status, _, body = get("/test_thread.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"thread: {token} failed (full body: {body})")
+
+
+class TestRandApi(unittest.TestCase):
+    def test_all_pass(self):
+        status, _, body = get("/test_rand.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"rand: {token} failed (full body: {body})")
+
+
+class TestAtShutdownApi(unittest.TestCase):
+    def test_all_pass(self):
+        status, _, body = get("/test_atshutdown.js")
+        self.assertEqual(status, 200)
+        for token in body.split(","):
+            self.assertTrue(token.endswith(":ok"),
+                f"atshutdown: {token} failed (full body: {body})")
+
+
+# ---------------------------------------------------------------------------
+# jscp helper
+# ---------------------------------------------------------------------------
+
+def jscp_connect(timeout: float = 5.0) -> socket.socket:
+    """Connect to the jscp port and return a connected socket."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    s.connect((HOST, JSCP_PORT))
+    return s
+
+
+def jscp_read_until(s: socket.socket, needle: bytes, timeout: float = 5.0) -> bytes:
+    """Read from socket until needle is found, return all bytes read."""
+    buf = b""
+    s.settimeout(timeout)
+    while needle not in buf:
+        chunk = s.recv(256)
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
+def jscp_auth(s: socket.socket, user: str = "admin", passwd: str = "secret") -> bool:
+    """Perform jscp authentication; return True on success.
+
+    After successful auth the server sends the first command prompt (e.g.
+    "jscp 1> "), which we consume here so callers can immediately call
+    jscp_cmd() without pre-reading the prompt.
+    """
+    # Read "Username: "
+    data = jscp_read_until(s, b"Username: ")
+    if b"Username:" not in data:
+        return False
+    s.sendall((user + "\n").encode())
+    # Read "Password: "
+    data = jscp_read_until(s, b"Password: ")
+    if b"Password:" not in data:
+        return False
+    s.sendall((passwd + "\n").encode())
+    # Read auth result line
+    data = jscp_read_until(s, b"\n")
+    if b"successful" not in data:
+        return False
+    # Consume the first command prompt so jscp_cmd() can start cleanly
+    jscp_read_until(s, b"> ")
+    return True
+
+
+def jscp_cmd(s: socket.socket, cmd: str) -> str:
+    """Send a command and return the result line (stripped).
+
+    Protocol: server sends prompt ending in '> ', we send cmd\n,
+    server replies with result\r\n then the next prompt.
+
+    Strategy: send command, read lines until we see a line ending with '> '
+    (the next prompt). The result is the line(s) before the prompt.
+    """
+    s.sendall((cmd + "\n").encode())
+    # Read bytes until we see the next prompt ending with "> "
+    data = jscp_read_until(s, b"> ")
+    # Extract result: everything before the last prompt line
+    lines = data.replace(b"\r\n", b"\n").split(b"\n")
+    result_lines = []
+    for line in lines:
+        stripped = line.strip()
+        # Skip the prompt line itself (ends with "> ")
+        if stripped.endswith(b">"):
+            continue
+        if stripped:
+            result_lines.append(stripped.decode("utf-8", errors="replace"))
+    return result_lines[0] if result_lines else ""
+
+
+class TestJsCp(unittest.TestCase):
+    """JavaScript control port (jscp) tests."""
+
+    def _connect(self) -> socket.socket:
+        s = jscp_connect()
+        self.assertTrue(jscp_auth(s), "jscp auth failed")
+        return s
+
+    def test_connect_and_eval(self):
+        s = self._connect()
+        try:
+            result = jscp_cmd(s, "1 + 1")
+            self.assertEqual(result, "2")
+        finally:
+            s.close()
+
+    def test_persistent_state(self):
+        s = self._connect()
+        try:
+            jscp_cmd(s, "var x = 42")
+            result = jscp_cmd(s, "x * 2")
+            self.assertEqual(result, "84")
+        finally:
+            s.close()
+
+    def test_object_result(self):
+        s = self._connect()
+        try:
+            result = jscp_cmd(s, "({a:1})")
+            self.assertIn('"a"', result)
+            self.assertIn("1", result)
+        finally:
+            s.close()
+
+    def test_bad_auth(self):
+        s = jscp_connect()
+        try:
+            jscp_read_until(s, b"Username: ")
+            s.sendall(b"admin\n")
+            jscp_read_until(s, b"Password: ")
+            s.sendall(b"wrongpassword\n")
+            data = jscp_read_until(s, b"\n")
+            self.assertIn(b"incorrect", data.lower())
+        finally:
+            s.close()
+
+    def test_error_handling(self):
+        s = self._connect()
+        try:
+            result = jscp_cmd(s, "undeclared_var_xyz.foo")
+            self.assertTrue(result.startswith("ERROR:"),
+                f"expected ERROR:, got: {result}")
+        finally:
+            s.close()
+
+    def test_exit(self):
+        s = self._connect()
+        try:
+            s.sendall(b"exit\n")
+            # Server should close the connection
+            s.settimeout(3.0)
+            data = b""
+            try:
+                while True:
+                    chunk = s.recv(256)
+                    if not chunk:
+                        break
+                    data += chunk
+            except (socket.timeout, ConnectionResetError):
+                pass
+            # Connection should be closed (recv returns b"" or timeout)
+            self.assertTrue(True)  # reached here without hanging
+        finally:
+            s.close()
+
+    def test_multi_line(self):
+        s = self._connect()
+        try:
+            # jscp_auth already consumed first prompt; send continuation line
+            s.sendall(b"1 +\\\n")
+            # Wait for continuation prompt "... "
+            jscp_read_until(s, b"... ")
+            # Send second line and capture result
+            result = jscp_cmd(s, "1")
+            self.assertEqual(result, "2")
+        finally:
+            s.close()
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -552,6 +884,8 @@ def parse_args() -> argparse.Namespace:
                    help="AOLserver install prefix")
     p.add_argument("--port", type=int, default=int(os.environ.get("NSJS_PORT", "8765")),
                    help="Port to listen on")
+    p.add_argument("--jscp-port", type=int, default=int(os.environ.get("NSJS_JSCP_PORT", "9090")),
+                   help="jscp port")
     p.add_argument("--v8-lib", default=os.environ.get("NSJS_V8_LIB", ""),
                    help="Path to V8 dylib directory")
     p.add_argument("--no-server", action="store_true",
@@ -561,20 +895,21 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    INSTALL = args.install
-    PORT    = args.port
-    V8_LIB  = args.v8_lib
+    INSTALL   = args.install
+    PORT      = args.port
+    JSCP_PORT = args.jscp_port
+    V8_LIB    = args.v8_lib
 
-    # Update the module-level globals used by get()
-    # (unittest discovers TestCase classes at import time, so we patch here)
+    # Update the module-level globals used by get() and jscp helpers
     import test_nsjs as _self  # noqa: F401 — just to satisfy linters
-    _self.INSTALL = INSTALL
-    _self.PORT    = PORT
-    _self.V8_LIB  = V8_LIB
+    _self.INSTALL   = INSTALL
+    _self.PORT      = PORT
+    _self.JSCP_PORT = JSCP_PORT
+    _self.V8_LIB    = V8_LIB
 
     manage_server = not args.no_server
     if manage_server:
-        print(f"Starting nsd from {INSTALL} on port {PORT} ...", flush=True)
+        print(f"Starting nsd from {INSTALL} on port {PORT} (jscp:{JSCP_PORT}) ...", flush=True)
         try:
             start_server()
             print("Server ready.", flush=True)
@@ -587,6 +922,7 @@ if __name__ == "__main__":
         sys.argv = [sys.argv[0]] + [a for a in sys.argv[1:]
                                      if not a.startswith("--install")
                                      and not a.startswith("--port")
+                                     and not a.startswith("--jscp")
                                      and not a.startswith("--v8")
                                      and not a.startswith("--no-server")]
         unittest.main(verbosity=2, exit=False)

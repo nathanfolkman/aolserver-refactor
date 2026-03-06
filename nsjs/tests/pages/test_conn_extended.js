@@ -30,4 +30,8 @@ out.push("status:ok");
 ns.conn.setContentType("text/plain");
 out.push("ctype:ok");
 
+/* location() returns a string like "http://host:port" */
+var loc = ns.conn.location();
+out.push(typeof loc === "string" && loc.length > 0 ? "location:ok" : "location:fail");
+
 ns.conn.write(out.join(","));

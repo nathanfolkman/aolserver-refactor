@@ -144,6 +144,33 @@ struct NsMod {
     char *server;
     char *module;
     char *pageRoot;
+    bool  scriptCacheEnabled = true;
+    bool  cacheStatAlways    = true;
+};
+
+/* -----------------------------------------------------------------------
+ * Per-script compilation cache entry (per-thread, no lock needed)
+ * --------------------------------------------------------------------- */
+
+struct JsScriptEntry {
+    time_t                        mtime           = 0;
+    v8::Global<v8::UnboundScript> script;
+
+    /* Per-thread stats (no lock needed) */
+    uint64_t  hitCount         = 0;
+    uint64_t  missCount        = 0;
+    uint64_t  invalidateCount  = 0;
+    uint64_t  totalExecUsec    = 0;
+    uint64_t  totalCompileUsec = 0;
+    time_t    lastCompileTime  = 0;
+    time_t    firstLoadTime    = 0;
+
+    /* move-only: v8::Global<> is not copyable */
+    JsScriptEntry() = default;
+    JsScriptEntry(JsScriptEntry &&) = default;
+    JsScriptEntry& operator=(JsScriptEntry &&) = default;
+    JsScriptEntry(const JsScriptEntry &) = delete;
+    JsScriptEntry& operator=(const JsScriptEntry &) = delete;
 };
 
 /* -----------------------------------------------------------------------
@@ -151,10 +178,16 @@ struct NsMod {
  * --------------------------------------------------------------------- */
 
 struct JsData {
-    v8::Isolate                        *isolate;
-    v8::ArrayBuffer::Allocator         *allocator;
+    v8::Isolate                        *isolate   = nullptr;
+    v8::ArrayBuffer::Allocator         *allocator = nullptr;
     v8::Persistent<v8::ObjectTemplate>  globalTmpl;
-    NsMod                              *modPtr;
+    NsMod                              *modPtr    = nullptr;
+
+    /* Per-thread compilation caches */
+    std::unordered_map<std::string, JsScriptEntry> scriptCache;
+    std::unordered_map<std::string, JsScriptEntry> adpCache;
+    bool  cacheEnabled    = true;
+    bool  cacheStatAlways = true;
 };
 
 /* -----------------------------------------------------------------------
@@ -186,6 +219,63 @@ static SharedStore js_shared;
 static std::unique_ptr<v8::Platform> js_platform;
 static Ns_Mutex                      platform_lock;
 static int                           platform_initialized = 0;
+
+/* -----------------------------------------------------------------------
+ * Global statistics — updated after each request (guarded by lock)
+ * --------------------------------------------------------------------- */
+
+struct NsJsStatsDelta {
+    uint64_t requests          = 0;
+    uint64_t adpRequests       = 0;
+    uint64_t cacheHits         = 0;
+    uint64_t cacheMisses       = 0;
+    uint64_t cacheInvalidations = 0;
+    uint64_t execUsec          = 0;
+    uint64_t compileUsec       = 0;
+    uint64_t compileErrors     = 0;
+    uint64_t runtimeErrors     = 0;
+    uint64_t newCacheEntries   = 0;
+    uint64_t newAdpEntries     = 0;
+    uint64_t contextCreations  = 0;
+    uint64_t contextUsec       = 0;
+};
+
+struct NsJsGlobalStats {
+    Ns_Mutex  lock;
+
+    /* Request counters */
+    uint64_t  totalRequests;
+    uint64_t  totalAdpRequests;
+    uint64_t  cacheHits;
+    uint64_t  cacheMisses;
+    uint64_t  cacheInvalidations;
+    uint64_t  totalExecUsec;
+    uint64_t  totalCompileUsec;
+
+    /* Error counters */
+    uint64_t  compileErrors;
+    uint64_t  runtimeErrors;
+
+    /* Cache size approximation (cumulative new entries across all threads) */
+    uint64_t  cachedScripts;
+    uint64_t  cachedAdpScripts;
+
+    /* Context creation */
+    uint64_t  contextCreations;
+    uint64_t  totalContextUsec;
+
+    /* Live isolate count */
+    uint64_t  activeIsolates;
+};
+
+static NsJsGlobalStats js_global_stats;
+
+/* -----------------------------------------------------------------------
+ * Global registry of live JsData pointers for cross-thread stats iteration
+ * --------------------------------------------------------------------- */
+
+static std::vector<JsData *> js_data_registry;
+static Ns_Mutex              js_data_registry_lock;
 
 /* -----------------------------------------------------------------------
  * TLS slot for per-thread JsData
@@ -297,10 +387,18 @@ public:
 
 static JsData *GetJsData(NsMod *modPtr);
 static void    DeleteJsData(void *arg);
+static void    NsJsUpdateGlobalStats(const NsJsStatsDelta &d);
 static void    BuildGlobalTemplate(v8::Isolate *isolate,
                                    v8::Local<v8::ObjectTemplate> &globalTmpl);
 static int     RunScript(NsJsContext *ctx, const std::string &source,
                          const std::string &filename);
+static v8::MaybeLocal<v8::UnboundScript>
+               CompileUnboundScript(v8::Isolate *iso, const std::string &source,
+                                    const std::string &filename);
+static int     RunCompiledScript(NsJsContext *ctx,
+                                 v8::Local<v8::UnboundScript> unbound,
+                                 const std::string &filename,
+                                 uint64_t *execUsecOut);
 static std::string CompileJsAdp(const std::string &source);
 
 static int JsRequest(void *arg, Ns_Conn *conn);
@@ -361,6 +459,11 @@ static void EnsurePlatformInit(void) {
         Ns_MutexInit(&js_set_map_lock);
         js_set_map = new std::unordered_map<int, Ns_Set*>();
 
+        /* Global stats and JsData registry */
+        memset(&js_global_stats, 0, sizeof(js_global_stats));
+        Ns_MutexInit(&js_global_stats.lock);
+        Ns_MutexInit(&js_data_registry_lock);
+
         platform_initialized = 1;
     }
     Ns_MutexUnlock(&platform_lock);
@@ -386,9 +489,11 @@ static void EnsureTlsAlloc(void) {
 static JsData *GetJsData(NsMod *modPtr) {
     JsData *dataPtr = static_cast<JsData *>(Ns_TlsGet(&js_tls));
     if (dataPtr == nullptr) {
-        dataPtr = static_cast<JsData *>(ns_calloc(1, sizeof(JsData)));
-        dataPtr->modPtr    = modPtr;
-        dataPtr->allocator = new NsAllocator();
+        dataPtr = new JsData();
+        dataPtr->modPtr        = modPtr;
+        dataPtr->cacheEnabled  = modPtr->scriptCacheEnabled;
+        dataPtr->cacheStatAlways = modPtr->cacheStatAlways;
+        dataPtr->allocator     = new NsAllocator();
 
         v8::Isolate::CreateParams params;
         params.array_buffer_allocator = dataPtr->allocator;
@@ -403,6 +508,15 @@ static JsData *GetJsData(NsMod *modPtr) {
         dataPtr->globalTmpl.Reset(dataPtr->isolate, tmpl);
 
         Ns_TlsSet(&js_tls, dataPtr);
+
+        /* Register for cross-thread stats iteration */
+        Ns_MutexLock(&js_data_registry_lock);
+        js_data_registry.push_back(dataPtr);
+        Ns_MutexUnlock(&js_data_registry_lock);
+
+        Ns_MutexLock(&js_global_stats.lock);
+        js_global_stats.activeIsolates++;
+        Ns_MutexUnlock(&js_global_stats.lock);
     }
     return dataPtr;
 }
@@ -415,14 +529,30 @@ static void DeleteJsData(void *arg) {
     JsData *dataPtr = static_cast<JsData *>(arg);
     if (dataPtr == nullptr) return;
 
+    /* Remove from registry before releasing V8 handles */
+    Ns_MutexLock(&js_data_registry_lock);
+    auto &reg = js_data_registry;
+    reg.erase(std::remove(reg.begin(), reg.end(), dataPtr), reg.end());
+    Ns_MutexUnlock(&js_data_registry_lock);
+
     {
         v8::Isolate::Scope isolate_scope(dataPtr->isolate);
         v8::HandleScope    handle_scope(dataPtr->isolate);
         dataPtr->globalTmpl.Reset();
+        /* Release all cached UnboundScript handles */
+        for (auto &[k, e] : dataPtr->scriptCache) e.script.Reset();
+        dataPtr->scriptCache.clear();
+        for (auto &[k, e] : dataPtr->adpCache)    e.script.Reset();
+        dataPtr->adpCache.clear();
     }
     dataPtr->isolate->Dispose();
     delete dataPtr->allocator;
-    ns_free(dataPtr);
+
+    Ns_MutexLock(&js_global_stats.lock);
+    if (js_global_stats.activeIsolates > 0) js_global_stats.activeIsolates--;
+    Ns_MutexUnlock(&js_global_stats.lock);
+
+    delete dataPtr;
 }
 
 /* -----------------------------------------------------------------------
@@ -3163,15 +3293,14 @@ static void JsCpSessionThread(void *arg) {
     params.array_buffer_allocator = alloc;
     v8::Isolate *iso = v8::Isolate::New(params);
 
-    /* Build a null-conn JsData so GetMod() works for ns.info etc. */
+    /* Build a null-conn JsData so GetMod() works for ns.info etc.
+     * Do NOT add this stack-allocated jdata to js_data_registry. */
     JsData jdata;
-    memset(&jdata, 0, sizeof(jdata));
-    jdata.isolate = iso;
+    jdata.isolate   = iso;
     jdata.allocator = alloc;
-    jdata.modPtr = cfg->modPtr;
+    jdata.modPtr    = cfg->modPtr;
 
-    NsJsContext jctx;
-    memset(&jctx, 0, sizeof(jctx));
+    NsJsContext jctx = {};
     jctx.dataPtr = &jdata;
     jctx.conn    = nullptr;
     Ns_DStringInit(&jctx.output);
@@ -3286,6 +3415,215 @@ static void JsCpListenerThread(void *arg) {
 static void JsCpInit(NsJsCpConfig *cfg) {
     Ns_MutexInit(&js_cp_conn_mx);
     Ns_ThreadCreate(JsCpListenerThread, cfg, 0, nullptr);
+}
+
+/* -----------------------------------------------------------------------
+ * NsJsUpdateGlobalStats — batch-add a delta to the global stats under lock
+ * --------------------------------------------------------------------- */
+
+static void NsJsUpdateGlobalStats(const NsJsStatsDelta &d) {
+    Ns_MutexLock(&js_global_stats.lock);
+    js_global_stats.totalRequests      += d.requests;
+    js_global_stats.totalAdpRequests   += d.adpRequests;
+    js_global_stats.cacheHits          += d.cacheHits;
+    js_global_stats.cacheMisses        += d.cacheMisses;
+    js_global_stats.cacheInvalidations += d.cacheInvalidations;
+    js_global_stats.totalExecUsec      += d.execUsec;
+    js_global_stats.totalCompileUsec   += d.compileUsec;
+    js_global_stats.compileErrors      += d.compileErrors;
+    js_global_stats.runtimeErrors      += d.runtimeErrors;
+    js_global_stats.cachedScripts      += d.newCacheEntries;
+    js_global_stats.cachedAdpScripts   += d.newAdpEntries;
+    js_global_stats.contextCreations   += d.contextCreations;
+    js_global_stats.totalContextUsec   += d.contextUsec;
+    Ns_MutexUnlock(&js_global_stats.lock);
+}
+
+/* -----------------------------------------------------------------------
+ * CompileUnboundScript — compile source to a context-independent UnboundScript
+ * --------------------------------------------------------------------- */
+
+static v8::MaybeLocal<v8::UnboundScript>
+CompileUnboundScript(v8::Isolate *iso, const std::string &source,
+                     const std::string &filename) {
+    v8::Local<v8::String> src =
+        v8::String::NewFromUtf8(iso, source.c_str(),
+                                v8::NewStringType::kNormal,
+                                static_cast<int>(source.size()))
+            .ToLocalChecked();
+    v8::Local<v8::String> fname =
+        v8::String::NewFromUtf8(iso, filename.c_str()).ToLocalChecked();
+    v8::ScriptOrigin origin(fname);
+    v8::ScriptCompiler::Source compSrc(src, origin);
+    return v8::ScriptCompiler::CompileUnboundScript(iso, &compSrc);
+}
+
+/* -----------------------------------------------------------------------
+ * RunCompiledScript — bind a cached UnboundScript to the current context
+ *                     and execute it.  Fills *execUsecOut with wall time.
+ * --------------------------------------------------------------------- */
+
+static int RunCompiledScript(NsJsContext *ctx,
+                              v8::Local<v8::UnboundScript> unbound,
+                              const std::string &filename,
+                              uint64_t *execUsecOut) {
+    v8::Isolate *iso = ctx->dataPtr->isolate;
+    v8::TryCatch trycatch(iso);
+    v8::Local<v8::Context> v8ctx = iso->GetCurrentContext();
+
+    v8::Local<v8::Script> script = unbound->BindToCurrentContext();
+
+    Ns_Time start, end, diff;
+    Ns_GetTime(&start);
+    v8::Local<v8::Value> result;
+    bool ok = script->Run(v8ctx).ToLocal(&result);
+    Ns_GetTime(&end);
+    Ns_DiffTime(&end, &start, &diff);
+    if (execUsecOut)
+        *execUsecOut = (uint64_t)diff.sec * 1000000 + (uint64_t)diff.usec;
+
+    if (!ok) {
+        v8::String::Utf8Value err(iso, trycatch.Exception());
+        Ns_Log(Error, nc("nsjs: runtime error in %s: %s"),
+               filename.c_str(), *err ? *err : "(unknown)");
+        if (!ctx->responseSent) Ns_ConnReturnInternalError(ctx->conn);
+        return NS_ERROR;
+    }
+    return NS_OK;
+}
+
+/* -----------------------------------------------------------------------
+ * ns.js.stats callbacks
+ * --------------------------------------------------------------------- */
+
+/* ns.js.stats.global() — return snapshot of global counters */
+static void JsStatsGlobal(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    v8::Isolate *iso = args.GetIsolate();
+    v8::Local<v8::Context> v8ctx = iso->GetCurrentContext();
+
+    /* Copy counters under lock */
+    uint64_t totalRequests, totalAdpRequests, cacheHits, cacheMisses,
+             cacheInvalidations, totalExecUsec, totalCompileUsec,
+             compileErrors, runtimeErrors, cachedScripts, cachedAdpScripts,
+             contextCreations, totalContextUsec, activeIsolates;
+
+    Ns_MutexLock(&js_global_stats.lock);
+    totalRequests      = js_global_stats.totalRequests;
+    totalAdpRequests   = js_global_stats.totalAdpRequests;
+    cacheHits          = js_global_stats.cacheHits;
+    cacheMisses        = js_global_stats.cacheMisses;
+    cacheInvalidations = js_global_stats.cacheInvalidations;
+    totalExecUsec      = js_global_stats.totalExecUsec;
+    totalCompileUsec   = js_global_stats.totalCompileUsec;
+    compileErrors      = js_global_stats.compileErrors;
+    runtimeErrors      = js_global_stats.runtimeErrors;
+    cachedScripts      = js_global_stats.cachedScripts;
+    cachedAdpScripts   = js_global_stats.cachedAdpScripts;
+    contextCreations   = js_global_stats.contextCreations;
+    totalContextUsec   = js_global_stats.totalContextUsec;
+    activeIsolates     = js_global_stats.activeIsolates;
+    Ns_MutexUnlock(&js_global_stats.lock);
+
+    v8::Local<v8::Object> obj = v8::Object::New(iso);
+    auto set = [&](const char *k, uint64_t v) {
+        obj->Set(v8ctx,
+                 v8::String::NewFromUtf8(iso, k).ToLocalChecked(),
+                 v8::Number::New(iso, static_cast<double>(v))).Check();
+    };
+    set("totalRequests",      totalRequests);
+    set("totalAdpRequests",   totalAdpRequests);
+    set("cacheHits",          cacheHits);
+    set("cacheMisses",        cacheMisses);
+    set("cacheInvalidations", cacheInvalidations);
+    set("totalExecUsec",      totalExecUsec);
+    set("totalCompileUsec",   totalCompileUsec);
+    set("compileErrors",      compileErrors);
+    set("runtimeErrors",      runtimeErrors);
+    set("cachedScripts",      cachedScripts);
+    set("cachedAdpScripts",   cachedAdpScripts);
+    set("contextCreations",   contextCreations);
+    set("totalContextUsec",   totalContextUsec);
+    set("activeIsolates",     activeIsolates);
+
+    args.GetReturnValue().Set(obj);
+}
+
+/* ns.js.stats.scripts() — return array of per-script snapshots (advisory) */
+static void JsStatsScripts(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    v8::Isolate *iso = args.GetIsolate();
+    v8::Local<v8::Context> v8ctx = iso->GetCurrentContext();
+
+    /* Snapshot path/stats from all registered JsData objects.
+     * We only hold the registry lock while copying POD fields — the
+     * per-thread caches are not V8-protected, so reads are advisory. */
+    struct ScriptSnap {
+        std::string path;
+        uint64_t hitCount, missCount, invalidateCount;
+        uint64_t totalExecUsec, totalCompileUsec;
+        time_t   lastCompileTime;
+    };
+    std::vector<ScriptSnap> snaps;
+
+    Ns_MutexLock(&js_data_registry_lock);
+    for (JsData *d : js_data_registry) {
+        for (auto &[path, e] : d->scriptCache) {
+            snaps.push_back({path, e.hitCount, e.missCount, e.invalidateCount,
+                             e.totalExecUsec, e.totalCompileUsec,
+                             e.lastCompileTime});
+        }
+        for (auto &[path, e] : d->adpCache) {
+            snaps.push_back({path + " [jsadp]", e.hitCount, e.missCount,
+                             e.invalidateCount, e.totalExecUsec,
+                             e.totalCompileUsec, e.lastCompileTime});
+        }
+    }
+    Ns_MutexUnlock(&js_data_registry_lock);
+
+    v8::Local<v8::Array> arr = v8::Array::New(iso, static_cast<int>(snaps.size()));
+    int idx = 0;
+    for (auto &s : snaps) {
+        v8::Local<v8::Object> obj = v8::Object::New(iso);
+        auto set = [&](const char *k, double v) {
+            obj->Set(v8ctx,
+                     v8::String::NewFromUtf8(iso, k).ToLocalChecked(),
+                     v8::Number::New(iso, v)).Check();
+        };
+        obj->Set(v8ctx,
+                 v8::String::NewFromUtf8(iso, "path").ToLocalChecked(),
+                 v8::String::NewFromUtf8(iso, s.path.c_str()).ToLocalChecked())
+           .Check();
+        set("hitCount",         static_cast<double>(s.hitCount));
+        set("missCount",        static_cast<double>(s.missCount));
+        set("invalidateCount",  static_cast<double>(s.invalidateCount));
+        set("totalExecUsec",    static_cast<double>(s.totalExecUsec));
+        set("totalCompileUsec", static_cast<double>(s.totalCompileUsec));
+        set("lastCompileTime",  static_cast<double>(s.lastCompileTime));
+        arr->Set(v8ctx, idx++, obj).Check();
+    }
+    args.GetReturnValue().Set(arr);
+}
+
+/* ns.js.stats.reset() — zero global counters (not per-script) */
+static void JsStatsReset(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    Ns_MutexLock(&js_global_stats.lock);
+    uint64_t live = js_global_stats.activeIsolates; /* preserve */
+    /* Reset only counter fields — do NOT touch the Ns_Mutex lock field */
+    js_global_stats.totalRequests      = 0;
+    js_global_stats.totalAdpRequests   = 0;
+    js_global_stats.cacheHits          = 0;
+    js_global_stats.cacheMisses        = 0;
+    js_global_stats.cacheInvalidations = 0;
+    js_global_stats.totalExecUsec      = 0;
+    js_global_stats.totalCompileUsec   = 0;
+    js_global_stats.compileErrors      = 0;
+    js_global_stats.runtimeErrors      = 0;
+    js_global_stats.cachedScripts      = 0;
+    js_global_stats.cachedAdpScripts   = 0;
+    js_global_stats.contextCreations   = 0;
+    js_global_stats.totalContextUsec   = 0;
+    js_global_stats.activeIsolates     = live;
+    Ns_MutexUnlock(&js_global_stats.lock);
+    args.GetReturnValue().SetUndefined();
 }
 
 /* -----------------------------------------------------------------------
@@ -3552,6 +3890,16 @@ static void BuildGlobalTemplate(v8::Isolate *isolate,
     nsObj->Set(isolate, "atshutdown", v8::FunctionTemplate::New(isolate, JsAtShutdown));
     nsObj->Set(isolate, "atsignal",   v8::FunctionTemplate::New(isolate, JsAtSignal));
 
+    /* ---- ns.js.stats ---- */
+    v8::Local<v8::ObjectTemplate> jsStatsObj = v8::ObjectTemplate::New(isolate);
+    jsStatsObj->Set(isolate, "global",  v8::FunctionTemplate::New(isolate, JsStatsGlobal));
+    jsStatsObj->Set(isolate, "scripts", v8::FunctionTemplate::New(isolate, JsStatsScripts));
+    jsStatsObj->Set(isolate, "reset",   v8::FunctionTemplate::New(isolate, JsStatsReset));
+
+    v8::Local<v8::ObjectTemplate> jsObj = v8::ObjectTemplate::New(isolate);
+    jsObj->Set(isolate, "stats", jsStatsObj);
+    nsObj->Set(isolate, "js", jsObj);
+
     globalTmpl->Set(isolate, "ns", nsObj);
 }
 
@@ -3566,34 +3914,51 @@ static int RunScript(NsJsContext *ctx, const std::string &source,
     v8::TryCatch   trycatch(iso);
     v8::Local<v8::Context> v8ctx = iso->GetCurrentContext();
 
-    v8::Local<v8::String> src =
-        v8::String::NewFromUtf8(iso, source.c_str(),
-                                v8::NewStringType::kNormal,
-                                static_cast<int>(source.size()))
-            .ToLocalChecked();
+    Ns_Time t0, t1, td;
 
-    v8::Local<v8::String> fname =
-        v8::String::NewFromUtf8(iso, filename.c_str()).ToLocalChecked();
-    v8::ScriptOrigin origin(fname);  /* V8 14+ dropped the Isolate* arg */
+    /* Compile */
+    Ns_GetTime(&t0);
+    v8::MaybeLocal<v8::UnboundScript> maybeUnbound =
+        CompileUnboundScript(iso, source, filename);
+    Ns_GetTime(&t1);
+    Ns_DiffTime(&t1, &t0, &td);
+    uint64_t compileUsec = (uint64_t)td.sec * 1000000 + (uint64_t)td.usec;
 
-    v8::Local<v8::Script> script;
-    if (!v8::Script::Compile(v8ctx, src, &origin).ToLocal(&script)) {
+    if (maybeUnbound.IsEmpty()) {
         v8::String::Utf8Value err(iso, trycatch.Exception());
         Ns_Log(Error, nc("nsjs: compile error in %s: %s"),
                filename.c_str(), *err ? *err : "(unknown)");
         if (!ctx->responseSent) Ns_ConnReturnInternalError(ctx->conn);
+        NsJsStatsDelta d; d.compileErrors = 1; d.compileUsec = compileUsec;
+        NsJsUpdateGlobalStats(d);
         return NS_ERROR;
     }
 
+    /* Bind and run */
+    v8::Local<v8::Script> script =
+        maybeUnbound.ToLocalChecked()->BindToCurrentContext();
+    Ns_GetTime(&t0);
     v8::Local<v8::Value> result;
-    if (!script->Run(v8ctx).ToLocal(&result)) {
+    bool ok = script->Run(v8ctx).ToLocal(&result);
+    Ns_GetTime(&t1);
+    Ns_DiffTime(&t1, &t0, &td);
+    uint64_t execUsec = (uint64_t)td.sec * 1000000 + (uint64_t)td.usec;
+
+    if (!ok) {
         v8::String::Utf8Value err(iso, trycatch.Exception());
         Ns_Log(Error, nc("nsjs: runtime error in %s: %s"),
                filename.c_str(), *err ? *err : "(unknown)");
         if (!ctx->responseSent) Ns_ConnReturnInternalError(ctx->conn);
+        NsJsStatsDelta d;
+        d.runtimeErrors = 1; d.execUsec = execUsec; d.compileUsec = compileUsec;
+        NsJsUpdateGlobalStats(d);
         return NS_ERROR;
     }
 
+    /* Update timing for the successful non-cached path */
+    NsJsStatsDelta d;
+    d.execUsec = execUsec; d.compileUsec = compileUsec;
+    NsJsUpdateGlobalStats(d);
     return NS_OK;
 }
 
@@ -3602,14 +3967,13 @@ static int RunScript(NsJsContext *ctx, const std::string &source,
  * --------------------------------------------------------------------- */
 
 static int JsRequest(void *arg, Ns_Conn *conn) {
-    NsMod  *modPtr = static_cast<NsMod *>(arg);
+    NsMod  *modPtr  = static_cast<NsMod *>(arg);
     JsData *dataPtr = GetJsData(modPtr);
 
     /* Resolve URL to filesystem path */
     Ns_DString path;
     Ns_DStringInit(&path);
-    if (Ns_UrlToFile(&path, modPtr->server,
-                     conn->request->url) != NS_OK) {
+    if (Ns_UrlToFile(&path, modPtr->server, conn->request->url) != NS_OK) {
         Ns_DStringFree(&path);
         return Ns_ConnReturnNotFound(conn);
     }
@@ -3619,18 +3983,10 @@ static int JsRequest(void *arg, Ns_Conn *conn) {
         Ns_DStringFree(&path);
         return Ns_ConnReturnNotFound(conn);
     }
-
-    /* Read file */
-    std::ifstream ifs(path.string);
+    std::string pathStr(path.string);
     Ns_DStringFree(&path);
-    if (!ifs) {
-        return Ns_ConnReturnInternalError(conn);
-    }
-    std::ostringstream ss;
-    ss << ifs.rdbuf();
-    std::string source = ss.str();
 
-    /* Set up per-request context */
+    /* Per-request context */
     NsJsContext ctx;
     ctx.dataPtr      = dataPtr;
     ctx.conn         = conn;
@@ -3643,23 +3999,126 @@ static int JsRequest(void *arg, Ns_Conn *conn) {
 
     v8::Local<v8::ObjectTemplate> tmpl =
         v8::Local<v8::ObjectTemplate>::New(iso, dataPtr->globalTmpl);
-    v8::Local<v8::Context> v8ctx =
-        v8::Context::New(iso, nullptr, tmpl);
 
-    /* Store NsJsContext pointer in embedder data slot 0 */
+    /* Create context (timed) */
+    Ns_Time t0, t1, td;
+    Ns_GetTime(&t0);
+    v8::Local<v8::Context> v8ctx = v8::Context::New(iso, nullptr, tmpl);
+    Ns_GetTime(&t1);
+    Ns_DiffTime(&t1, &t0, &td);
+    uint64_t ctxUsec = (uint64_t)td.sec * 1000000 + (uint64_t)td.usec;
+
     v8ctx->SetEmbedderData(0, v8::External::New(iso, &ctx));
-
     v8::Context::Scope ctx_scope(v8ctx);
 
     std::string filename(conn->request->url);
-    int rc = RunScript(&ctx, source, filename);
+    NsJsStatsDelta delta;
+    delta.requests         = 1;
+    delta.contextCreations = 1;
+    delta.contextUsec      = ctxUsec;
 
-    if (rc == NS_OK && !ctx.responseSent) {
-        Ns_ConnReturnHtml(conn, 200,
-                          ctx.output.string,
-                          ctx.output.length);
+    int rc = NS_OK;
+
+    if (dataPtr->cacheEnabled) {
+        auto &cache = dataPtr->scriptCache;
+        auto  it    = cache.find(pathStr);
+
+        bool hit = (it != cache.end()) &&
+                   (!dataPtr->cacheStatAlways ||
+                    it->second.mtime == st.st_mtime);
+
+        if (hit) {
+            /* Cache hit: bind and run */
+            JsScriptEntry &entry = it->second;
+            entry.hitCount++;
+            delta.cacheHits = 1;
+
+            v8::Local<v8::UnboundScript> unbound =
+                v8::Local<v8::UnboundScript>::New(iso, entry.script);
+            uint64_t execUsec = 0;
+            rc = RunCompiledScript(&ctx, unbound, filename, &execUsec);
+            entry.totalExecUsec += execUsec;
+            delta.execUsec      = execUsec;
+            if (rc != NS_OK) delta.runtimeErrors = 1;
+
+        } else {
+            /* Cache miss: read file, compile, store */
+            std::ifstream ifs(pathStr);
+            if (!ifs) {
+                Ns_DStringFree(&ctx.output);
+                return Ns_ConnReturnInternalError(conn);
+            }
+            std::ostringstream ss;
+            ss << ifs.rdbuf();
+            std::string source = ss.str();
+
+            v8::TryCatch trycatch(iso);
+            Ns_GetTime(&t0);
+            v8::MaybeLocal<v8::UnboundScript> maybeUnbound =
+                CompileUnboundScript(iso, source, filename);
+            Ns_GetTime(&t1);
+            Ns_DiffTime(&t1, &t0, &td);
+            uint64_t compileUsec = (uint64_t)td.sec * 1000000 + (uint64_t)td.usec;
+
+            if (maybeUnbound.IsEmpty()) {
+                v8::String::Utf8Value err(iso, trycatch.Exception());
+                Ns_Log(Error, nc("nsjs: compile error in %s: %s"),
+                       filename.c_str(), *err ? *err : "(unknown)");
+                if (!ctx.responseSent) Ns_ConnReturnInternalError(conn);
+                delta.cacheMisses   = 1;
+                delta.compileUsec   = compileUsec;
+                delta.compileErrors = 1;
+                NsJsUpdateGlobalStats(delta);
+                Ns_DStringFree(&ctx.output);
+                return NS_ERROR;
+            }
+
+            bool isNew          = (it == cache.end());
+            bool isInvalidation = (!isNew && it->second.mtime != st.st_mtime);
+            time_t now          = time(nullptr);
+            time_t firstLoad    = isNew ? now : it->second.firstLoadTime;
+
+            JsScriptEntry newEntry;
+            newEntry.mtime            = st.st_mtime;
+            newEntry.missCount        = 1;
+            newEntry.invalidateCount  = isInvalidation ? 1u : 0u;
+            newEntry.totalCompileUsec = compileUsec;
+            newEntry.lastCompileTime  = now;
+            newEntry.firstLoadTime    = firstLoad;
+            newEntry.script.Reset(iso, maybeUnbound.ToLocalChecked());
+            cache[pathStr] = std::move(newEntry);
+
+            delta.cacheMisses        = 1;
+            delta.compileUsec        = compileUsec;
+            delta.newCacheEntries    = isNew ? 1u : 0u;
+            delta.cacheInvalidations = isInvalidation ? 1u : 0u;
+
+            v8::Local<v8::UnboundScript> unbound =
+                v8::Local<v8::UnboundScript>::New(iso, cache[pathStr].script);
+            uint64_t execUsec = 0;
+            rc = RunCompiledScript(&ctx, unbound, filename, &execUsec);
+            cache[pathStr].totalExecUsec += execUsec;
+            delta.execUsec              = execUsec;
+            if (rc != NS_OK) delta.runtimeErrors = 1;
+        }
+    } else {
+        /* Cache disabled: read and run directly */
+        std::ifstream ifs(pathStr);
+        if (!ifs) {
+            Ns_DStringFree(&ctx.output);
+            return Ns_ConnReturnInternalError(conn);
+        }
+        std::ostringstream ss;
+        ss << ifs.rdbuf();
+        rc = RunScript(&ctx, ss.str(), filename);
+        /* RunScript handles its own error stats; we only add the request */
     }
 
+    NsJsUpdateGlobalStats(delta);
+
+    if (rc == NS_OK && !ctx.responseSent) {
+        Ns_ConnReturnHtml(conn, 200, ctx.output.string, ctx.output.length);
+    }
     Ns_DStringFree(&ctx.output);
     return rc;
 }
@@ -3740,8 +4199,7 @@ static int JsAdpRequest(void *arg, Ns_Conn *conn) {
     /* Resolve URL to filesystem path */
     Ns_DString path;
     Ns_DStringInit(&path);
-    if (Ns_UrlToFile(&path, modPtr->server,
-                     conn->request->url) != NS_OK) {
+    if (Ns_UrlToFile(&path, modPtr->server, conn->request->url) != NS_OK) {
         Ns_DStringFree(&path);
         return Ns_ConnReturnNotFound(conn);
     }
@@ -3751,17 +4209,8 @@ static int JsAdpRequest(void *arg, Ns_Conn *conn) {
         Ns_DStringFree(&path);
         return Ns_ConnReturnNotFound(conn);
     }
-
-    std::ifstream ifs(path.string);
+    std::string pathStr(path.string);
     Ns_DStringFree(&path);
-    if (!ifs) {
-        return Ns_ConnReturnInternalError(conn);
-    }
-    std::ostringstream ss;
-    ss << ifs.rdbuf();
-    std::string adpSource = ss.str();
-
-    std::string jsSource = CompileJsAdp(adpSource);
 
     NsJsContext ctx;
     ctx.dataPtr      = dataPtr;
@@ -3775,21 +4224,127 @@ static int JsAdpRequest(void *arg, Ns_Conn *conn) {
 
     v8::Local<v8::ObjectTemplate> tmpl =
         v8::Local<v8::ObjectTemplate>::New(iso, dataPtr->globalTmpl);
-    v8::Local<v8::Context> v8ctx =
-        v8::Context::New(iso, nullptr, tmpl);
+
+    /* Create context (timed) */
+    Ns_Time t0, t1, td;
+    Ns_GetTime(&t0);
+    v8::Local<v8::Context> v8ctx = v8::Context::New(iso, nullptr, tmpl);
+    Ns_GetTime(&t1);
+    Ns_DiffTime(&t1, &t0, &td);
+    uint64_t ctxUsec = (uint64_t)td.sec * 1000000 + (uint64_t)td.usec;
 
     v8ctx->SetEmbedderData(0, v8::External::New(iso, &ctx));
     v8::Context::Scope ctx_scope(v8ctx);
 
     std::string filename = std::string(conn->request->url) + " [jsadp]";
-    int rc = RunScript(&ctx, jsSource, filename);
+    NsJsStatsDelta delta;
+    delta.requests         = 1;
+    delta.adpRequests      = 1;
+    delta.contextCreations = 1;
+    delta.contextUsec      = ctxUsec;
 
-    if (rc == NS_OK && !ctx.responseSent) {
-        Ns_ConnReturnHtml(conn, 200,
-                          ctx.output.string,
-                          ctx.output.length);
+    int rc = NS_OK;
+
+    if (dataPtr->cacheEnabled) {
+        auto &cache = dataPtr->adpCache;
+        auto  it    = cache.find(pathStr);
+
+        bool hit = (it != cache.end()) &&
+                   (!dataPtr->cacheStatAlways ||
+                    it->second.mtime == st.st_mtime);
+
+        if (hit) {
+            /* Cache hit: bind and run */
+            JsScriptEntry &entry = it->second;
+            entry.hitCount++;
+            delta.cacheHits = 1;
+
+            v8::Local<v8::UnboundScript> unbound =
+                v8::Local<v8::UnboundScript>::New(iso, entry.script);
+            uint64_t execUsec = 0;
+            rc = RunCompiledScript(&ctx, unbound, filename, &execUsec);
+            entry.totalExecUsec += execUsec;
+            delta.execUsec      = execUsec;
+            if (rc != NS_OK) delta.runtimeErrors = 1;
+
+        } else {
+            /* Cache miss: read + ADP-transform + compile + store */
+            std::ifstream ifs(pathStr);
+            if (!ifs) {
+                Ns_DStringFree(&ctx.output);
+                return Ns_ConnReturnInternalError(conn);
+            }
+            std::ostringstream ss;
+            ss << ifs.rdbuf();
+            std::string jsSource = CompileJsAdp(ss.str());
+
+            v8::TryCatch trycatch(iso);
+            Ns_GetTime(&t0);
+            v8::MaybeLocal<v8::UnboundScript> maybeUnbound =
+                CompileUnboundScript(iso, jsSource, filename);
+            Ns_GetTime(&t1);
+            Ns_DiffTime(&t1, &t0, &td);
+            uint64_t compileUsec = (uint64_t)td.sec * 1000000 + (uint64_t)td.usec;
+
+            if (maybeUnbound.IsEmpty()) {
+                v8::String::Utf8Value err(iso, trycatch.Exception());
+                Ns_Log(Error, nc("nsjs: compile error in %s: %s"),
+                       filename.c_str(), *err ? *err : "(unknown)");
+                if (!ctx.responseSent) Ns_ConnReturnInternalError(conn);
+                delta.cacheMisses   = 1;
+                delta.compileUsec   = compileUsec;
+                delta.compileErrors = 1;
+                NsJsUpdateGlobalStats(delta);
+                Ns_DStringFree(&ctx.output);
+                return NS_ERROR;
+            }
+
+            bool isNew          = (it == cache.end());
+            bool isInvalidation = (!isNew && it->second.mtime != st.st_mtime);
+            time_t now          = time(nullptr);
+            time_t firstLoad    = isNew ? now : it->second.firstLoadTime;
+
+            JsScriptEntry newEntry;
+            newEntry.mtime            = st.st_mtime;
+            newEntry.missCount        = 1;
+            newEntry.invalidateCount  = isInvalidation ? 1u : 0u;
+            newEntry.totalCompileUsec = compileUsec;
+            newEntry.lastCompileTime  = now;
+            newEntry.firstLoadTime    = firstLoad;
+            newEntry.script.Reset(iso, maybeUnbound.ToLocalChecked());
+            cache[pathStr] = std::move(newEntry);
+
+            delta.cacheMisses        = 1;
+            delta.compileUsec        = compileUsec;
+            delta.newAdpEntries      = isNew ? 1u : 0u;
+            delta.cacheInvalidations = isInvalidation ? 1u : 0u;
+
+            v8::Local<v8::UnboundScript> unbound =
+                v8::Local<v8::UnboundScript>::New(iso, cache[pathStr].script);
+            uint64_t execUsec = 0;
+            rc = RunCompiledScript(&ctx, unbound, filename, &execUsec);
+            cache[pathStr].totalExecUsec += execUsec;
+            delta.execUsec              = execUsec;
+            if (rc != NS_OK) delta.runtimeErrors = 1;
+        }
+    } else {
+        /* Cache disabled: read and run directly */
+        std::ifstream ifs(pathStr);
+        if (!ifs) {
+            Ns_DStringFree(&ctx.output);
+            return Ns_ConnReturnInternalError(conn);
+        }
+        std::ostringstream ss;
+        ss << ifs.rdbuf();
+        std::string jsSource = CompileJsAdp(ss.str());
+        rc = RunScript(&ctx, jsSource, filename);
     }
 
+    NsJsUpdateGlobalStats(delta);
+
+    if (rc == NS_OK && !ctx.responseSent) {
+        Ns_ConnReturnHtml(conn, 200, ctx.output.string, ctx.output.length);
+    }
     Ns_DStringFree(&ctx.output);
     return rc;
 }
@@ -3802,9 +4357,9 @@ extern "C" int NsJs_ModInit(char *server, char *module) {
     EnsurePlatformInit();
     EnsureTlsAlloc();
 
-    NsMod *modPtr = static_cast<NsMod *>(ns_calloc(1, sizeof(NsMod)));
-    modPtr->server   = ns_strdup(server);
-    modPtr->module   = ns_strdup(module);
+    NsMod *modPtr  = new NsMod();
+    modPtr->server = ns_strdup(server);
+    modPtr->module = ns_strdup(module);
 
     /* Resolve page root — default to server's page root */
     Ns_DString ds;
@@ -3812,6 +4367,21 @@ extern "C" int NsJs_ModInit(char *server, char *module) {
     Ns_UrlToFile(&ds, server, nc("/"));
     modPtr->pageRoot = ns_strdup(ds.string);
     Ns_DStringFree(&ds);
+
+    /* Cache configuration */
+    {
+        char section[256];
+        snprintf(section, sizeof(section),
+                 "ns/server/%s/module/%s", server, module);
+
+        int cacheEnabled = 1;  /* default: on */
+        Ns_ConfigGetBool(section, nc("js_script_cache"), &cacheEnabled);
+        modPtr->scriptCacheEnabled = (cacheEnabled != 0);
+
+        int statAlways = 1;    /* default: stat every request */
+        Ns_ConfigGetBool(section, nc("js_cache_stat_always"), &statAlways);
+        modPtr->cacheStatAlways = (statAlways != 0);
+    }
 
     static const char *methods[] = { "GET", "HEAD", "POST", nullptr };
 
@@ -3878,6 +4448,9 @@ extern "C" int NsJs_ModInit(char *server, char *module) {
         }
     }
 
-    Ns_Log(Notice, nc("nsjs: module loaded for server '%s'"), server);
+    Ns_Log(Notice, nc("nsjs: module loaded for server '%s' (cache=%s, stat_always=%s)"),
+           server,
+           modPtr->scriptCacheEnabled ? "on" : "off",
+           modPtr->cacheStatAlways    ? "on" : "off");
     return NS_OK;
 }

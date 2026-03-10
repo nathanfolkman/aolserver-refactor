@@ -22,7 +22,7 @@ target_include_directories(nsjs SYSTEM PRIVATE
     ${CMAKE_BINARY_DIR}/deps/install/include
 )
 
-target_link_libraries(nsjs PRIVATE nsd V8::V8)
+target_link_libraries(nsjs PRIVATE nsd V8::V8 Tcmalloc::Tcmalloc)
 
 add_dependencies(nsjs tcl_ep gperftools_ep)
 

@@ -58,6 +58,10 @@ if (authUser !== cfgUser || authPasswd !== cfgPass) {
             }
             return out;
         })(),
+        adpStats:          ns.adp.stats(),
+        sockcallbacks:     ns.info.sockcallbacks(),
+        logTail:           ns.log.tail(8192),
+        memorySizeClasses: ns.memory.sizeClasses(),
     };
 
     ns.conn.setContentType("application/json");

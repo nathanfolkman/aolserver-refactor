@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
+    "echarts": "^5",
     "react": "^18",
     "react-dom": "^18"
   },

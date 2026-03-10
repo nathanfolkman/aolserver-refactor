@@ -2,15 +2,17 @@ import React from "react";
 import { StatCard } from "../components/StatCard.jsx";
 import { Card, CardHeader, CardTitle, CardContent } from "../components/Card.jsx";
 import { RingGauge } from "../components/MiniChart.jsx";
+import { EChartsWrapper } from "../components/EChartsWrapper.jsx";
 
 function avgMs(usec, count) {
   if (!count) return "—";
   return ((usec / count) / 1000).toFixed(2) + " ms";
 }
 
-export function JsEngine({ jsStats }) {
+export function JsEngine({ jsStats, history }) {
   if (!jsStats) return null;
   const s = jsStats;
+  const hist = history || [];
 
   const totalLookups = (s.cacheHits ?? 0) + (s.cacheMisses ?? 0);
   const hitRate = totalLookups > 0 ? s.cacheHits / totalLookups : 0;
@@ -53,6 +55,35 @@ export function JsEngine({ jsStats }) {
         <StatCard label="Avg Compile Time"   value={avgMs(s.totalCompileUsec, s.cacheMisses)} />
         <StatCard label="Cache Invalidations" value={s.cacheInvalidations} />
       </div>
+
+      {hist.length > 1 && (
+        <Card>
+          <CardHeader><CardTitle>Request History</CardTitle></CardHeader>
+          <CardContent>
+            <EChartsWrapper
+              style={{ width: "100%", height: 160 }}
+              option={{
+                animation: false,
+                grid: { top: 8, bottom: 28, left: 40, right: 12 },
+                tooltip: { trigger: "axis" },
+                xAxis: { type: "category",
+                  data: hist.map((h) => new Date(h.t).toLocaleTimeString()),
+                  axisLabel: { fontSize: 10 } },
+                yAxis: { type: "value", minInterval: 1, axisLabel: { fontSize: 10 } },
+                series: [{
+                  name: "Active",
+                  type: "line",
+                  smooth: true,
+                  symbol: "none",
+                  lineStyle: { color: "#8b5cf6" },
+                  itemStyle: { color: "#8b5cf6" },
+                  data: hist.map((h) => h.active ?? 0),
+                }],
+              }}
+            />
+          </CardContent>
+        </Card>
+      )}
     </div>
   );
 }

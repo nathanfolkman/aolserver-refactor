@@ -4,6 +4,7 @@ import { ProgressBar } from "../components/ProgressBar.jsx";
 import { DataTable } from "../components/DataTable.jsx";
 import { Card, CardHeader, CardTitle, CardContent } from "../components/Card.jsx";
 import { RingGauge } from "../components/MiniChart.jsx";
+import { EChartsWrapper } from "../components/EChartsWrapper.jsx";
 
 function fmtTime(epoch) {
   if (!epoch) return "—";
@@ -15,8 +16,30 @@ function fmtUsec(usec) {
   return (usec / 1e6).toFixed(6) + "s";
 }
 
-export function ServerStats({ server, locks, threads, scheduled }) {
+function makeTimeseriesOption(history, series, title) {
+  const times = history.map((h) => new Date(h.t).toLocaleTimeString());
+  return {
+    animation: false,
+    grid: { top: 24, bottom: 28, left: 40, right: 12 },
+    tooltip: { trigger: "axis" },
+    legend: { top: 0, right: 0, textStyle: { fontSize: 11 } },
+    xAxis: { type: "category", data: times, axisLabel: { fontSize: 10 } },
+    yAxis: { type: "value", minInterval: 1, axisLabel: { fontSize: 10 } },
+    series: series.map(({ key, name, color }) => ({
+      name,
+      type: "line",
+      smooth: true,
+      symbol: "none",
+      lineStyle: { color },
+      itemStyle: { color },
+      data: history.map((h) => h[key] ?? 0),
+    })),
+  };
+}
+
+export function ServerStats({ server, locks, threads, scheduled, history }) {
   if (!server) return null;
+  const hist = history || [];
   const t = server.threads || {};
   const max     = t.max || 1;
   const current = t.current || 0;
@@ -98,6 +121,38 @@ export function ServerStats({ server, locks, threads, scheduled }) {
           </Card>
         )}
       </div>
+
+      {/* Connection History */}
+      {hist.length > 1 && (
+        <Card>
+          <CardHeader><CardTitle>Connection History</CardTitle></CardHeader>
+          <CardContent>
+            <EChartsWrapper
+              style={{ width: "100%", height: 200 }}
+              option={makeTimeseriesOption(hist, [
+                { key: "active", name: "Active",  color: "#3b82f6" },
+                { key: "queued", name: "Queued",  color: "#f59e0b" },
+              ])}
+            />
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Thread History */}
+      {hist.length > 1 && (
+        <Card>
+          <CardHeader><CardTitle>Thread Pool History</CardTitle></CardHeader>
+          <CardContent>
+            <EChartsWrapper
+              style={{ width: "100%", height: 200 }}
+              option={makeTimeseriesOption(hist, [
+                { key: "threads",    name: "Current", color: "#3b82f6" },
+                { key: "threadsMax", name: "Max",     color: "#e2e8f0" },
+              ])}
+            />
+          </CardContent>
+        </Card>
+      )}
 
       {/* URL Stats */}
       {urlstats.length > 0 && (

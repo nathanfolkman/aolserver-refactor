@@ -1,25 +1,32 @@
-/**
- * client-entry.jsx — browser rendering + live polling
- *
- * Renders the full React app client-side from embedded JSON data,
- * then polls stats-api.js every 5 seconds for live updates.
- */
-import React from "react";
+import React, { useState } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App.jsx";
 
 const root = createRoot(document.getElementById("root"));
 const initialData = window.__STATS_DATA__ || {};
 
-root.render(<App data={initialData} />);
+let currentHistory = [];
 
-/* Live polling */
+function renderWithData(data, hist) {
+  root.render(<App data={data} history={hist} />);
+}
+
+renderWithData(initialData, currentHistory);
+
 async function poll() {
   try {
     const res = await fetch("stats-api.js", { credentials: "same-origin" });
     if (!res.ok) return;
     const data = await res.json();
-    root.render(<App data={data} />);
+    currentHistory = [...currentHistory, {
+      t:          Date.now(),
+      active:     data.server?.active   ?? 0,
+      queued:     data.server?.queued   ?? 0,
+      threads:    data.server?.threads?.current ?? 0,
+      threadsMax: data.server?.threads?.max     ?? 0,
+      memAlloc:   data.memory?.["generic.current_allocated_bytes"] ?? 0,
+    }].slice(-60);
+    renderWithData(data, currentHistory);
   } catch {
     /* Ignore transient fetch errors */
   }

@@ -420,6 +420,9 @@ static void JsInfoScheduled(const v8::FunctionCallbackInfo<v8::Value> &args);
 static void JsServerUrlStats(const v8::FunctionCallbackInfo<v8::Value> &args);
 static void JsCacheNames(const v8::FunctionCallbackInfo<v8::Value> &args);
 static void JsCacheStatsAll(const v8::FunctionCallbackInfo<v8::Value> &args);
+static void JsAdpStats(const v8::FunctionCallbackInfo<v8::Value> &args);
+static void JsMemorySizeClasses(const v8::FunctionCallbackInfo<v8::Value> &args);
+static void JsLogTail(const v8::FunctionCallbackInfo<v8::Value> &args);
 
 static int JsRequest(void *arg, Ns_Conn *conn);
 static int JsAdpRequest(void *arg, Ns_Conn *conn);
@@ -2556,6 +2559,51 @@ static void JsLogRoll(const v8::FunctionCallbackInfo<v8::Value> &/*args*/) {
 }
 
 /* -----------------------------------------------------------------------
+ * ns.log.tail(nbytes) — read last N bytes of the server error log
+ * Default nbytes = 8192. Returns empty string on error.
+ * --------------------------------------------------------------------- */
+static void JsLogTail(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    v8::Isolate *iso = args.GetIsolate();
+    int nbytes = 8192;
+    if (args.Length() >= 1 && args[0]->IsNumber()) {
+        nbytes = static_cast<int>(args[0]->Int32Value(iso->GetCurrentContext()).FromMaybe(8192));
+        if (nbytes <= 0) nbytes = 8192;
+    }
+    char *logPath = Ns_InfoErrorLog();
+    if (!logPath || !*logPath) {
+        args.GetReturnValue().Set(v8s(iso, ""));
+        return;
+    }
+    int fd = ::open(logPath, O_RDONLY);
+    if (fd < 0) {
+        args.GetReturnValue().Set(v8s(iso, ""));
+        return;
+    }
+    off_t fileSize = lseek(fd, 0, SEEK_END);
+    if (fileSize <= 0) {
+        close(fd);
+        args.GetReturnValue().Set(v8s(iso, ""));
+        return;
+    }
+    off_t readSize = (static_cast<off_t>(nbytes) < fileSize) ? static_cast<off_t>(nbytes) : fileSize;
+    off_t startPos = fileSize - readSize;
+    if (lseek(fd, startPos, SEEK_SET) < 0) {
+        close(fd);
+        args.GetReturnValue().Set(v8s(iso, ""));
+        return;
+    }
+    std::string buf(static_cast<size_t>(readSize), '\0');
+    ssize_t got = read(fd, &buf[0], static_cast<size_t>(readSize));
+    close(fd);
+    if (got <= 0) {
+        args.GetReturnValue().Set(v8s(iso, ""));
+        return;
+    }
+    buf.resize(static_cast<size_t>(got));
+    args.GetReturnValue().Set(v8s(iso, buf.c_str()));
+}
+
+/* -----------------------------------------------------------------------
  * ns.config.section(name) -> JS object of key/value pairs, or null
  * ns.config.sections()    -> array of section name strings
  * --------------------------------------------------------------------- */
@@ -3689,6 +3737,95 @@ static void JsMemoryStats(const v8::FunctionCallbackInfo<v8::Value> &args) {
 }
 
 /* -----------------------------------------------------------------------
+ * ns.memory.sizeClasses() — tcmalloc size class stats via MallocExtension_GetStats
+ * Returns array of {class, size, freeObjects, freeBytes, pages}
+ * --------------------------------------------------------------------- */
+static void JsMemorySizeClasses(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    typedef void (*GetStatsFn)(char *, int);
+    static GetStatsFn get_stats = nullptr;
+    static int        looked_up = 0;
+    if (!looked_up) {
+        looked_up = 1;
+        get_stats = reinterpret_cast<GetStatsFn>(
+            dlsym(RTLD_DEFAULT, "MallocExtension_GetStats"));
+    }
+
+    v8::Isolate *iso = args.GetIsolate();
+    v8::Local<v8::Context> ctx = iso->GetCurrentContext();
+    v8::Local<v8::Array> arr = v8::Array::New(iso);
+
+    if (!get_stats) {
+        args.GetReturnValue().Set(arr);
+        return;
+    }
+
+    static char buf[1024 * 1024];
+    get_stats(buf, static_cast<int>(sizeof(buf)));
+
+    uint32_t idx = 0;
+    char *line = buf;
+    while (*line) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        int cls = 0, sz = 0, objs = 0, bytes = 0, pages = 0;
+        if (sscanf(line, " class %d [ %d bytes ] : %d objs; %d bytes; %d pages",
+                   &cls, &sz, &objs, &bytes, &pages) == 5) {
+            v8::Local<v8::Object> obj = v8::Object::New(iso);
+            obj->Set(ctx, v8s(iso, "class"),       v8::Number::New(iso, cls)).Check();
+            obj->Set(ctx, v8s(iso, "size"),        v8::Number::New(iso, sz)).Check();
+            obj->Set(ctx, v8s(iso, "freeObjects"), v8::Number::New(iso, objs)).Check();
+            obj->Set(ctx, v8s(iso, "freeBytes"),   v8::Number::New(iso, bytes)).Check();
+            obj->Set(ctx, v8s(iso, "pages"),       v8::Number::New(iso, pages)).Check();
+            arr->Set(ctx, idx++, obj).Check();
+        }
+        if (!nl) break;
+        line = nl + 1;
+    }
+    args.GetReturnValue().Set(arr);
+}
+
+/* -----------------------------------------------------------------------
+ * ns.adp.stats() — ADP page cache entries via ns_adp_stats
+ * Returns array of {file, dev, ino, mtime, refcnt, evals, size, blocks, scripts}
+ * --------------------------------------------------------------------- */
+static void JsAdpStats(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    NsJsContext *jsctx = GetCtx(args);
+    if (!jsctx) { args.GetReturnValue().SetNull(); return; }
+    NsMod *mod = jsctx->dataPtr->modPtr;
+    v8::Isolate *iso = args.GetIsolate();
+    v8::Local<v8::Context> v8ctx = iso->GetCurrentContext();
+    v8::Local<v8::Array> arr = v8::Array::New(iso);
+
+    std::string result = TclEvalCmd(mod->server, "ns_adp_stats");
+    if (result.empty()) { args.GetReturnValue().Set(arr); return; }
+
+    Tcl_Interp *interp = Ns_TclAllocateInterp(mod->server);
+    char **outerKv = nullptr; int outerCount = 0;
+    if (Tcl_SplitList(interp, nc(result.c_str()), &outerCount, &outerKv) == TCL_OK
+        && outerCount >= 2) {
+        uint32_t idx = 0;
+        for (int i = 0; i + 1 < outerCount; i += 2) {
+            v8::Local<v8::Object> obj = v8::Object::New(iso);
+            obj->Set(v8ctx, v8s(iso, "file"), v8s(iso, outerKv[i])).Check();
+            /* parse flat kv list: "dev N ino N mtime N refcnt N evals N size N blocks N scripts N" */
+            char **kv = nullptr; int kvCount = 0;
+            if (Tcl_SplitList(interp, outerKv[i+1], &kvCount, &kv) == TCL_OK
+                && kvCount >= 16) {
+                for (int j = 0; j + 1 < kvCount; j += 2) {
+                    obj->Set(v8ctx, v8s(iso, kv[j]),
+                             v8::Number::New(iso, atof(kv[j+1]))).Check();
+                }
+                Tcl_Free(reinterpret_cast<char *>(kv));
+            }
+            arr->Set(v8ctx, idx++, obj).Check();
+        }
+        Tcl_Free(reinterpret_cast<char *>(outerKv));
+    }
+    Ns_TclDeAllocateInterp(interp);
+    args.GetReturnValue().Set(arr);
+}
+
+/* -----------------------------------------------------------------------
  * ns.info.locks() — returns array of lock info objects
  * Each element: {name, owner, id, nlock, nbusy}
  * --------------------------------------------------------------------- */
@@ -4419,6 +4556,7 @@ static void BuildGlobalTemplate(v8::Isolate *isolate,
     /* ---- ns.log (callable fn with sub-properties) ---- */
     v8::Local<v8::FunctionTemplate> logFn = v8::FunctionTemplate::New(isolate, JsLog);
     logFn->Set(isolate, "roll", v8::FunctionTemplate::New(isolate, JsLogRoll));
+    logFn->Set(isolate, "tail", v8::FunctionTemplate::New(isolate, JsLogTail));
 
     /* ---- ns.config (callable fn with sub-properties) ---- */
     v8::Local<v8::FunctionTemplate> configFn = v8::FunctionTemplate::New(isolate, JsConfig);
@@ -4478,8 +4616,14 @@ static void BuildGlobalTemplate(v8::Isolate *isolate,
 
     /* ---- ns.memory ---- */
     v8::Local<v8::ObjectTemplate> memObj = v8::ObjectTemplate::New(isolate);
-    memObj->Set(isolate, "stats", v8::FunctionTemplate::New(isolate, JsMemoryStats));
+    memObj->Set(isolate, "stats",       v8::FunctionTemplate::New(isolate, JsMemoryStats));
+    memObj->Set(isolate, "sizeClasses", v8::FunctionTemplate::New(isolate, JsMemorySizeClasses));
     nsObj->Set(isolate, "memory", memObj);
+
+    /* ---- ns.adp ---- */
+    v8::Local<v8::ObjectTemplate> adpObj = v8::ObjectTemplate::New(isolate);
+    adpObj->Set(isolate, "stats", v8::FunctionTemplate::New(isolate, JsAdpStats));
+    nsObj->Set(isolate, "adp", adpObj);
 
     /* ---- ns.js.stats ---- */
     v8::Local<v8::ObjectTemplate> jsStatsObj = v8::ObjectTemplate::New(isolate);

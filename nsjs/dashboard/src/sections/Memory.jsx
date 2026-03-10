@@ -3,6 +3,7 @@ import { StatCard } from "../components/StatCard.jsx";
 import { Card, CardHeader, CardTitle, CardContent } from "../components/Card.jsx";
 import { ProgressBar } from "../components/ProgressBar.jsx";
 import { RingGauge } from "../components/MiniChart.jsx";
+import { EChartsWrapper } from "../components/EChartsWrapper.jsx";
 
 function fmtBytes(b) {
   if (b == null) return "—";
@@ -12,7 +13,7 @@ function fmtBytes(b) {
   return b + " B";
 }
 
-export function Memory({ memory }) {
+export function Memory({ memory, memorySizeClasses, history }) {
   if (!memory) return null;
 
   if (!memory.available) {
@@ -97,6 +98,80 @@ export function Memory({ memory }) {
           </dl>
         </CardContent>
       </Card>
+
+      {/* Per-size-class breakdown */}
+      <Card>
+        <CardHeader><CardTitle>Size Class Breakdown</CardTitle></CardHeader>
+        <CardContent>
+          {(!memorySizeClasses || memorySizeClasses.length === 0) ? (
+            <p className="text-muted-foreground text-sm">
+              Size class data unavailable. Note: tcmalloc does not expose per-thread
+              allocation breakdown.
+            </p>
+          ) : (() => {
+            const top = [...memorySizeClasses]
+              .sort((a, b) => b.freeBytes - a.freeBytes)
+              .slice(0, 20);
+            return (
+              <EChartsWrapper
+                style={{ width: "100%", height: Math.max(200, top.length * 20) }}
+                option={{
+                  animation: false,
+                  grid: { top: 8, bottom: 28, left: 56, right: 12 },
+                  tooltip: {
+                    trigger: "axis",
+                    formatter: (params) => {
+                      const p = params[0];
+                      return `${p.name}: ${fmtBytes(p.value)}`;
+                    },
+                  },
+                  xAxis: { type: "value", axisLabel: { fontSize: 10,
+                    formatter: (v) => fmtBytes(v) } },
+                  yAxis: { type: "category",
+                    data: top.map((c) => `${c.size}B`),
+                    axisLabel: { fontSize: 10 } },
+                  series: [{
+                    type: "bar",
+                    data: top.map((c) => c.freeBytes),
+                    itemStyle: { color: "#3b82f6" },
+                  }],
+                }}
+              />
+            );
+          })()}
+        </CardContent>
+      </Card>
+
+      {/* Memory over time */}
+      {history && history.length > 1 && (
+        <Card>
+          <CardHeader><CardTitle>Memory Over Time</CardTitle></CardHeader>
+          <CardContent>
+            <EChartsWrapper
+              style={{ width: "100%", height: 200 }}
+              option={{
+                animation: false,
+                grid: { top: 24, bottom: 28, left: 60, right: 12 },
+                tooltip: { trigger: "axis",
+                  formatter: (params) => params.map(
+                    (p) => `${p.seriesName}: ${fmtBytes(p.value)}`
+                  ).join("<br/>") },
+                legend: { top: 0, right: 0, textStyle: { fontSize: 11 } },
+                xAxis: { type: "category",
+                  data: history.map((h) => new Date(h.t).toLocaleTimeString()),
+                  axisLabel: { fontSize: 10 } },
+                yAxis: { type: "value", axisLabel: { fontSize: 10,
+                  formatter: (v) => fmtBytes(v) } },
+                series: [
+                  { name: "Allocated", type: "line", smooth: true, symbol: "none",
+                    lineStyle: { color: "#3b82f6" }, itemStyle: { color: "#3b82f6" },
+                    data: history.map((h) => h.memAlloc) },
+                ],
+              }}
+            />
+          </CardContent>
+        </Card>
+      )}
     </div>
   );
 }

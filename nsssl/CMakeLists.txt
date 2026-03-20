@@ -9,6 +9,9 @@ target_include_directories(nsssl
 )
 target_link_libraries(nsssl PRIVATE nsd OpenSSL::SSL OpenSSL::Crypto)
 set_target_properties(nsssl PROPERTIES PREFIX "" SUFFIX ".so")
-add_dependencies(nsssl tcl_ep gperftools_ep openssl_ep)
+add_dependencies(nsssl tcl_ep gperftools_ep)
+if(NOT NS_USE_SYSTEM_OPENSSL)
+    add_dependencies(nsssl openssl_ep)
+endif()
 
 install(TARGETS nsssl LIBRARY DESTINATION bin)

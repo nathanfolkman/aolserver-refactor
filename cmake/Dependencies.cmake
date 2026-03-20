@@ -77,54 +77,58 @@ set_target_properties(Tcl::Tcl PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${DEPS_INSTALL_DIR}/include")
 add_dependencies(Tcl::Tcl tcl_ep)
 
-# ── OpenSSL 3.5.0 (LTS; QUIC server APIs for HTTP/3 via ngtcp2 crypto_ossl) ───
-if(APPLE)
-    set(OPENSSL_SSL_LIB "${DEPS_INSTALL_DIR}/lib/libssl.dylib")
-    set(OPENSSL_CRYPTO_LIB "${DEPS_INSTALL_DIR}/lib/libcrypto.dylib")
+# ── OpenSSL: bundled 3.5.0 (HTTP/3 QUIC) or system libs (HTTP/2 CI / dev) ─────
+if(NS_USE_SYSTEM_OPENSSL)
+    find_package(OpenSSL 3 REQUIRED)
 else()
-    set(OPENSSL_SSL_LIB "${DEPS_INSTALL_DIR}/lib/libssl.so")
-    set(OPENSSL_CRYPTO_LIB "${DEPS_INSTALL_DIR}/lib/libcrypto.so")
+    if(APPLE)
+        set(OPENSSL_SSL_LIB "${DEPS_INSTALL_DIR}/lib/libssl.dylib")
+        set(OPENSSL_CRYPTO_LIB "${DEPS_INSTALL_DIR}/lib/libcrypto.dylib")
+    else()
+        set(OPENSSL_SSL_LIB "${DEPS_INSTALL_DIR}/lib/libssl.so")
+        set(OPENSSL_CRYPTO_LIB "${DEPS_INSTALL_DIR}/lib/libcrypto.so")
+    endif()
+
+    if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
+        set(OPENSSL_TARGET "darwin64-arm64-cc")
+    elseif(APPLE)
+        set(OPENSSL_TARGET "darwin64-x86_64-cc")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+        set(OPENSSL_TARGET "linux-aarch64")
+    else()
+        set(OPENSSL_TARGET "linux-x86_64")
+    endif()
+
+    ExternalProject_Add(openssl_ep
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        URL https://www.openssl.org/source/openssl-3.5.0.tar.gz
+        URL_HASH SHA256=344d0a79f1a9b08029b0744e2cc401a43f9c90acd1044d09a530b4885a8e9fc0
+        INSTALL_DIR "${DEPS_INSTALL_DIR}"
+        # no-apps: only libraries are required (nsssl, nghttp2, ngtcp2). Building the
+        # openssl(1) CLI can fail linking on some Linux CI images; skip it.
+        # build_libs: build only libcrypto/libssl (do not run the default target, which
+        # can still build apps on some toolchains if configure is cached incorrectly).
+        CONFIGURE_COMMAND <SOURCE_DIR>/Configure
+            ${OPENSSL_TARGET}
+            --prefix=<INSTALL_DIR>
+            --openssldir=<INSTALL_DIR>/ssl
+            shared
+            no-tests
+            no-apps
+        BUILD_COMMAND make -j4 build_libs
+        INSTALL_COMMAND make install_sw
+        BUILD_BYPRODUCTS "${OPENSSL_SSL_LIB}" "${OPENSSL_CRYPTO_LIB}"
+    )
+
+    add_library(OpenSSL::SSL SHARED IMPORTED GLOBAL)
+    set_target_properties(OpenSSL::SSL PROPERTIES
+        IMPORTED_LOCATION "${OPENSSL_SSL_LIB}"
+        INTERFACE_INCLUDE_DIRECTORIES "${DEPS_INSTALL_DIR}/include")
+    add_dependencies(OpenSSL::SSL openssl_ep)
+
+    add_library(OpenSSL::Crypto SHARED IMPORTED GLOBAL)
+    set_target_properties(OpenSSL::Crypto PROPERTIES
+        IMPORTED_LOCATION "${OPENSSL_CRYPTO_LIB}"
+        INTERFACE_INCLUDE_DIRECTORIES "${DEPS_INSTALL_DIR}/include")
+    add_dependencies(OpenSSL::Crypto openssl_ep)
 endif()
-
-if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
-    set(OPENSSL_TARGET "darwin64-arm64-cc")
-elseif(APPLE)
-    set(OPENSSL_TARGET "darwin64-x86_64-cc")
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
-    set(OPENSSL_TARGET "linux-aarch64")
-else()
-    set(OPENSSL_TARGET "linux-x86_64")
-endif()
-
-ExternalProject_Add(openssl_ep
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-    URL https://www.openssl.org/source/openssl-3.5.0.tar.gz
-    URL_HASH SHA256=344d0a79f1a9b08029b0744e2cc401a43f9c90acd1044d09a530b4885a8e9fc0
-    INSTALL_DIR "${DEPS_INSTALL_DIR}"
-    # no-apps: only libraries are required (nsssl, nghttp2, ngtcp2). Building the
-    # openssl(1) CLI can fail linking on some Linux CI images; skip it.
-    # build_libs: build only libcrypto/libssl (do not run the default target, which
-    # can still build apps on some toolchains if configure is cached incorrectly).
-    CONFIGURE_COMMAND <SOURCE_DIR>/Configure
-        ${OPENSSL_TARGET}
-        --prefix=<INSTALL_DIR>
-        --openssldir=<INSTALL_DIR>/ssl
-        shared
-        no-tests
-        no-apps
-    BUILD_COMMAND make -j4 build_libs
-    INSTALL_COMMAND make install_sw
-    BUILD_BYPRODUCTS "${OPENSSL_SSL_LIB}" "${OPENSSL_CRYPTO_LIB}"
-)
-
-add_library(OpenSSL::SSL SHARED IMPORTED GLOBAL)
-set_target_properties(OpenSSL::SSL PROPERTIES
-    IMPORTED_LOCATION "${OPENSSL_SSL_LIB}"
-    INTERFACE_INCLUDE_DIRECTORIES "${DEPS_INSTALL_DIR}/include")
-add_dependencies(OpenSSL::SSL openssl_ep)
-
-add_library(OpenSSL::Crypto SHARED IMPORTED GLOBAL)
-set_target_properties(OpenSSL::Crypto PROPERTIES
-    IMPORTED_LOCATION "${OPENSSL_CRYPTO_LIB}"
-    INTERFACE_INCLUDE_DIRECTORIES "${DEPS_INSTALL_DIR}/include")
-add_dependencies(OpenSSL::Crypto openssl_ep)

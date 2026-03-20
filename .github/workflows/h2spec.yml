@@ -19,10 +19,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential curl openssl
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential curl openssl libssl-dev
 
       - name: Configure (no nsjs/V8 — faster CI)
-        run: cmake -S . -B build -G Ninja -DNS_WITH_V8=OFF
+        # Link against distro OpenSSL 3.x; skip building openssl_ep (avoids fragile source builds on runners).
+        run: cmake -S . -B build -G Ninja -DNS_WITH_V8=OFF -DNS_USE_SYSTEM_OPENSSL=ON
 
       - name: Build
         run: cmake --build build -j"$(nproc)"

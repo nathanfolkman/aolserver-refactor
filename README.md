@@ -23,10 +23,13 @@ cmake --build build-h3 -j8
 The dynamic loader must find `libnsd`, `libnsthread`, and bundled Tcl/OpenSSL/nghttp2 libraries:
 
 ```sh
+tests/h2test/generate-tls-certs.sh   # self-signed cert.pem + key.pem (gitignored; OpenSSL CLI)
 export DYLD_LIBRARY_PATH="$PWD/build/nsd:$PWD/build/nsthread:$PWD/build/deps/install/lib"
 export NS_TCL_LIBRARY="$PWD/build/deps/install/lib/tcl8.6"
 ./build/nsd/nsd -f -t tests/h2test/minimal.tcl
 ```
+
+`tests/h2test/run-h2spec.sh --start-nsd` and `tests/h3test/run-h3spec.sh --start-nsd` run the generator automatically. Manual runs (e.g. `stress-parallel-h2.sh` after starting `nsd` by hand) need the PEMs present first.
 
 Give the process **~10 seconds** after “listening” before hitting TLS: reader threads are created on demand, and the first connection may arrive before the reader pool is ready. Avoid firing several parallel TLS clients in the first second after startup; an intermittent crash has been observed under that pattern and needs further isolation.
 
@@ -79,7 +82,7 @@ Field names: `feed_ok`, `feed_mem_recv_err`, `trysend_recoveries`, `sessions_cre
 
 ### CI regression (h2spec)
 
-On push/PR to `main` or `master`, **GitHub Actions** (`.github/workflows/h2spec.yml`) configures CMake with **`-DNS_WITH_V8=OFF`**, builds **nsd**, installs the **h2spec** Linux binary, and runs **`tests/h2test/run-h2spec.sh --start-nsd`** with a 120s per-case timeout. Bundled OpenSSL uses **`no-apps`** and **`make build_libs`** (libraries only) so CI does not link the **`openssl`** CLI, which can fail on some Linux runners. Adjust branches in the workflow file if your default branch differs.
+On push/PR to `main` or `master`, **GitHub Actions** (`.github/workflows/h2spec.yml`) configures CMake with **`-DNS_WITH_V8=OFF`**, builds **nsd**, installs the **h2spec** Linux binary and the system **`openssl`** package (for **`tests/h2test/generate-tls-certs.sh`**), and runs **`tests/h2test/run-h2spec.sh --start-nsd`** with a 120s per-case timeout. Bundled OpenSSL uses **`no-apps`** and **`make build_libs`** (libraries only) so the **CMake-built** tree does not ship the **`openssl`** CLI; CI uses the distro **`openssl`** only to mint ephemeral test PEMs. Adjust branches in the workflow file if your default branch differs.
 
 ### Debugging with AddressSanitizer / lldb
 

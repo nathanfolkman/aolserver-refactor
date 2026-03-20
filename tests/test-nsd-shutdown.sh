@@ -168,6 +168,8 @@ if [[ ! -x "$NSD_BIN" ]]; then
   exit 2
 fi
 
+"$ROOT/tests/h2test/generate-tls-certs.sh"
+
 echo "test-nsd-shutdown: mode=$MODE nsd=$NSD_BIN config=$CONFIG log=$LOG" >&2
 if [[ "$MODE" == h3 ]]; then
   echo "test-nsd-shutdown: H3SPEC_PORT=$H3SPEC_PORT NSSOCK_PORT=$NSSOCK_PORT" >&2

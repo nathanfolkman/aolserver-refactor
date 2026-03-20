@@ -177,6 +177,7 @@ if [[ "$START_NSD" -eq 1 ]]; then
     echo "run-h3spec: nsd not found at $NSD_BIN (build with -DNS_WITH_HTTP3=ON)" >&2
     exit 2
   fi
+  "$ROOT/tests/h2test/generate-tls-certs.sh"
   export DYLD_LIBRARY_PATH="${DYLD_LIBRARY_PATH:-$NSD_BUILD_DIR/nsd:$NSD_BUILD_DIR/nsthread:$NSD_BUILD_DIR/deps/install/lib}"
   export NS_TCL_LIBRARY="${NS_TCL_LIBRARY:-$NSD_BUILD_DIR/deps/install/lib/tcl8.6}"
   echo "run-h3spec: starting nsd: $NSD_BIN" >&2

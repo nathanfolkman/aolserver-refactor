@@ -5,6 +5,8 @@
 #   build/nsd/nsd -ft tests/h2test/minimal.tcl
 # Optional: NSD_BUILD_DIR (e.g. build-h3) so modules match the nsd binary; NSSOCK_PORT
 # when 127.0.0.1:8080 is already in use; H2SPEC_TLS_PORT for nsssl (default 8443).
+# TLS PEMs under servers/<server>/modules/nsssl/ are gitignored; run
+# tests/h2test/generate-tls-certs.sh (or use run-h2spec.sh --start-nsd).
 
 set homedir      [file normalize [file dirname [ns_info config]]]
 set top          [file normalize [file join $homedir ../..]]

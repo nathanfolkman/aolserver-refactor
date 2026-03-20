@@ -55,6 +55,7 @@ if [[ "$START_NSD" -eq 1 ]]; then
     echo "run-h2spec: nsd not found at $NSD_BIN (build first)" >&2
     exit 2
   fi
+  "$ROOT/tests/h2test/generate-tls-certs.sh"
   export DYLD_LIBRARY_PATH="${DYLD_LIBRARY_PATH:-$ROOT/build/nsd:$ROOT/build/nsthread:$ROOT/build/deps/install/lib}"
   export NS_TCL_LIBRARY="${NS_TCL_LIBRARY:-$ROOT/build/deps/install/lib/tcl8.6}"
   "$NSD_BIN" -f -t "$CONFIG" &

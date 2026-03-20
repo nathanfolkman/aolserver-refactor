@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential curl
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential curl openssl
 
       - name: Configure (no nsjs/V8 — faster CI)
         run: cmake -S . -B build -G Ninja -DNS_WITH_V8=OFF

@@ -4,3 +4,6 @@
 
 # Optional vendored h3spec binary (download from releases; too large for this repo)
 /tests/h3test/bin/h3spec
+
+# Self-signed TLS for tests/h2test/minimal.tcl (generated locally; never commit)
+/tests/h2test/servers/s1/modules/nsssl/*.pem

@@ -79,7 +79,7 @@ Field names: `feed_ok`, `feed_mem_recv_err`, `trysend_recoveries`, `sessions_cre
 
 ### CI regression (h2spec)
 
-On push/PR to `main` or `master`, **GitHub Actions** (`.github/workflows/h2spec.yml`) configures CMake with **`-DNS_WITH_V8=OFF`**, builds **nsd**, installs the **h2spec** Linux binary, and runs **`tests/h2test/run-h2spec.sh --start-nsd`** with a 120s per-case timeout. Adjust branches in the workflow file if your default branch differs.
+On push/PR to `main` or `master`, **GitHub Actions** (`.github/workflows/h2spec.yml`) configures CMake with **`-DNS_WITH_V8=OFF`**, builds **nsd**, installs the **h2spec** Linux binary, and runs **`tests/h2test/run-h2spec.sh --start-nsd`** with a 120s per-case timeout. Bundled OpenSSL is configured with **`no-apps`** (libraries only) so the dependency build does not link the **`openssl`** CLI, which can fail on some Linux runners. Adjust branches in the workflow file if your default branch differs.
 
 ### Debugging with AddressSanitizer / lldb
 

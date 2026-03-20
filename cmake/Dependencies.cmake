@@ -101,12 +101,15 @@ ExternalProject_Add(openssl_ep
     URL https://www.openssl.org/source/openssl-3.5.0.tar.gz
     URL_HASH SHA256=344d0a79f1a9b08029b0744e2cc401a43f9c90acd1044d09a530b4885a8e9fc0
     INSTALL_DIR "${DEPS_INSTALL_DIR}"
+    # no-apps: only libraries are required (nsssl, nghttp2, ngtcp2). Building the
+    # openssl(1) CLI can fail linking on some Linux CI images; skip it.
     CONFIGURE_COMMAND <SOURCE_DIR>/Configure
         ${OPENSSL_TARGET}
         --prefix=<INSTALL_DIR>
         --openssldir=<INSTALL_DIR>/ssl
         shared
         no-tests
+        no-apps
     BUILD_COMMAND make -j4
     INSTALL_COMMAND make install_sw
     BUILD_BYPRODUCTS "${OPENSSL_SSL_LIB}" "${OPENSSL_CRYPTO_LIB}"

@@ -12,6 +12,8 @@
 #cmakedefine HAVE_INTTYPES_H 1
 #cmakedefine HAVE_POLL 1
 #cmakedefine HAVE__NSGETENVIRON 1
+#cmakedefine01 HAVE_NGHTTP2
+#cmakedefine01 HAVE_NGHTTP3
 
 /* Always defined: Tcl API compat */
 #define NO_CONST 1

@@ -131,6 +131,7 @@ SockProc(Ns_DriverCmd cmd, Ns_Sock *sock, struct iovec *bufs, int nbufs)
 
     case DriverKeep:
     case DriverClose:
+    case DriverTlsAppPending:
 	/* NB: Nothing to do. */
 	n = 0;
 	break;

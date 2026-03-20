@@ -44,6 +44,7 @@ if (authUser !== cfgUser || authPasswd !== cfgPass) {
             urlstats:    ns.server.urlstats(),
         },
         drivers:   ns.driver.list(),
+        http2:     ns.http2.stats(),
         locks:     ns.info.locks(),
         threads:   ns.info.threads(),
         scheduled: ns.info.scheduled(),

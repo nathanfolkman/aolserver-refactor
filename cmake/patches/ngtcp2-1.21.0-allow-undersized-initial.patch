@@ -1,0 +1,18 @@
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -6570,14 +6570,6 @@
+ 
+     assert(conn->in_pktns);
+ 
+     if (conn->server) {
+-      if (dgramlen < NGTCP2_MAX_UDP_PAYLOAD_SIZE) {
+-        ngtcp2_log_infof(
+-          &conn->log, NGTCP2_LOG_EVENT_PKT,
+-          "Initial packet was ignored because it is included in UDP datagram "
+-          "less than %d bytes: %zu bytes",
+-          NGTCP2_MAX_UDP_PAYLOAD_SIZE, dgramlen);
+-        return NGTCP2_ERR_DISCARD_PKT;
+-      }
+       if (conn->local.settings.tokenlen) {
+         rv = verify_token(conn->local.settings.token,
+                           conn->local.settings.tokenlen, &hd);

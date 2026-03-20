@@ -666,8 +666,24 @@ void *
 Ns_ConnDriverContext(Ns_Conn *conn)
 {
     Conn *connPtr = (Conn *) conn;
+    Sock *sp;
 
-    return (void *)(connPtr->sockPtr ? connPtr->sockPtr->arg : NULL);
+    if (connPtr->sockPtr == NULL) {
+	return NULL;
+    }
+    sp = connPtr->sockPtr;
+    if ((sp->drvPtr->opts & NS_DRIVER_SSL) != 0 && sp->arg != NULL) {
+	/*
+	 * nsssl stores NsSslSockArg { SSL *ssl; Ns_Mutex lock; } in arg.
+	 */
+	typedef struct {
+	    void *ssl;
+	    Ns_Mutex lock;
+	} NsSslSockArgLayout;
+
+	return ((NsSslSockArgLayout *) sp->arg)->ssl;
+    }
+    return sp->arg;
 }
 
 

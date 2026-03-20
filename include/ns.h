@@ -91,8 +91,87 @@
 #define NS_CONN_TIMEOUT	       	  0x400
 #define NS_CONN_GZIP		  0x800
 #define NS_CONN_CHUNK		  0x1000
+#define NS_CONN_HTTP2		  0x2000
+#define NS_CONN_H2_BODY		  0x4000
+#define NS_CONN_HTTP3		  0x8000
+#define NS_CONN_H3_BODY		  0x10000
 
 #define NS_CONN_MAXCLS		 16
+
+/*
+ * Application protocol selected after TLS ALPN (nsssl). Used by the core
+ * to branch HTTP/2 processing; plain HTTP/1 stays NS_APP_PROTO_UNKNOWN.
+ */
+#define NS_APP_PROTO_UNKNOWN   0
+#define NS_APP_PROTO_HTTP11    1
+#define NS_APP_PROTO_H2        2
+#define NS_APP_PROTO_H3        3
+
+/*
+ * HTTP/2 global counters (process-wide; TLS ALPN h2). Populated when built
+ * with nghttp2. See Tcl ns_http2 stats, ns_driver query http2, ns.http2.stats().
+ */
+typedef struct NsHttp2Stats {
+    unsigned long long feed_ok;
+    unsigned long long feed_mem_recv_err;
+    unsigned long long trysend_recoveries;
+    unsigned long long sessions_created;
+    unsigned long long sessions_destroyed;
+    unsigned long long streams_dispatched;
+    unsigned long long rst_stream_sent;
+    unsigned long long session_send_fail;
+    unsigned long long bytes_sent;
+    unsigned long long ping_recv;
+    unsigned long long goaway_recv;
+    unsigned long long rst_stream_recv;
+    unsigned long long goaway_sent;
+    unsigned long long ping_sent;
+    unsigned long long ping_ack_sent;
+    unsigned long long defer_appends;
+    unsigned long long defer_max_depth;
+    unsigned long long trysend_drain_reads;
+    unsigned long long bytes_fed;
+} NsHttp2Stats;
+
+NS_EXTERN void NsHttp2StatsGet(NsHttp2Stats *outPtr);
+
+#if HAVE_NGHTTP3
+/*
+ * HTTP/3 / QUIC counters (process-wide and per-driver). See Tcl ns_http3 stats.
+ */
+typedef struct NsHttp3Stats {
+    unsigned long long packets_recv;
+    unsigned long long packets_sent;
+    unsigned long long bytes_recv_udp;
+    unsigned long long bytes_sent_udp;
+    unsigned long long conn_accepted;
+    unsigned long long conn_closed;
+    unsigned long long handshake_completed;
+    unsigned long long handshake_fail;
+    unsigned long long streams_dispatched;
+    unsigned long long read_pkt_err;
+    unsigned long long send_fail;
+    unsigned long long version_negotiation_sent;
+    unsigned long long defer_appends;
+    unsigned long long defer_max_depth;
+} NsHttp3Stats;
+
+NS_EXTERN void NsHttp3StatsGet(NsHttp3Stats *outPtr);
+NS_EXTERN void Ns_Http3DriverStatsSnapshot(void *driverPtr, NsHttp3Stats *outPtr);
+/*
+ * Called from nsssl after Ns_DriverInit: opens QUIC UDP, separate SSL_CTX for h3.
+ */
+NS_EXTERN int Ns_Http3AttachDriver(void *driverPtr, const char *nssslConfigPath);
+#endif /* HAVE_NGHTTP3 */
+
+/*
+ * Locate a network driver by full name (e.g. s1/nsssl). Returns Driver * as void *.
+ */
+NS_EXTERN void *Ns_DriverFindByFullName(const char *fullname);
+
+#if HAVE_NGHTTP2
+NS_EXTERN void Ns_Http2DriverStatsSnapshot(void *driverPtr, NsHttp2Stats *outPtr);
+#endif
 
 #define NS_AOLSERVER_3_PLUS
 #define NS_UNAUTHORIZED		(-2)
@@ -457,6 +536,7 @@ typedef struct Ns_Sock {
     Ns_Driver *driver;
     SOCKET sock;
     void  *arg;
+    int    app_protocol; /* NS_APP_PROTO_* */
 } Ns_Sock;
 
 /*
@@ -468,8 +548,19 @@ typedef enum {
     DriverRecv,
     DriverSend,
     DriverKeep,
-    DriverClose
+    DriverClose,
+    /*
+     * TLS only: return 1 if OpenSSL has decrypted application data waiting
+     * for SSL_read (poll may miss POLLIN when ciphertext is already consumed).
+     */
+    DriverTlsAppPending
 } Ns_DriverCmd;
+
+/*
+ * DriverRecv return value: peer completed a TLS shutdown (SSL_ERROR_ZERO_RETURN).
+ * Used by nsssl; other drivers must not return this sentinel.
+ */
+#define NS_DRIVER_RECV_TLS_EOF (-2)
 
 /*
  * The following typedef defines a socket driver

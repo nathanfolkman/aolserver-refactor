@@ -59,6 +59,8 @@
  *     ns.atshutdown(jsCode) / ns.atsignal(jsCode)
  *     ns.info.serverName
  *     ns.conn.location()
+ *     ns.http2.stats() / ns.http2.stats("s1/nsssl") — HTTP/2 counters (global or per-driver)
+ *     ns.http3.stats() / ns.http3.stats("s1/nsssl") — HTTP/3 / QUIC counters (when built)
  *
  *   JavaScript control port (jscp):
  *     Configured via ns/server/<server>/module/<module> params:
@@ -411,6 +413,8 @@ static void JsServerKeepalive(const v8::FunctionCallbackInfo<v8::Value> &args);
 static void JsServerPools(const v8::FunctionCallbackInfo<v8::Value> &args);
 static void JsDriverList(const v8::FunctionCallbackInfo<v8::Value> &args);
 static void JsDriverQuery(const v8::FunctionCallbackInfo<v8::Value> &args);
+static void JsHttp2Stats(const v8::FunctionCallbackInfo<v8::Value> &args);
+static void JsHttp3Stats(const v8::FunctionCallbackInfo<v8::Value> &args);
 static void JsMemoryStats(const v8::FunctionCallbackInfo<v8::Value> &args);
 static void JsInfoLocks(const v8::FunctionCallbackInfo<v8::Value> &args);
 static void JsInfoThreads(const v8::FunctionCallbackInfo<v8::Value> &args);
@@ -1365,6 +1369,105 @@ static void JsDriverQuery(const v8::FunctionCallbackInfo<v8::Value> &args) {
     std::string cmd  = std::string("ns_driver query ") + name;
     std::string result = TclEvalCmd(mod->server, cmd.c_str());
     args.GetReturnValue().Set(TclKvListToJsObject(iso, result));
+}
+
+/*
+ * ns.http2.stats() — process-wide counters.
+ * ns.http2.stats("s1/nsssl") — counters for that driver only (nghttp2 builds).
+ */
+static void JsHttp2Stats(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    v8::Isolate *iso = args.GetIsolate();
+    v8::Local<v8::Context> ctx = iso->GetCurrentContext();
+    NsHttp2Stats st;
+
+#if HAVE_NGHTTP2
+    if (args.Length() >= 1 && args[0]->IsString()) {
+        std::string dn = V8ToString(iso, args[0]);
+        void *dp = Ns_DriverFindByFullName(dn.c_str());
+        if (dp == nullptr) {
+            args.GetReturnValue().SetNull();
+            return;
+        }
+        Ns_Http2DriverStatsSnapshot(dp, &st);
+    } else {
+        NsHttp2StatsGet(&st);
+    }
+#else
+    (void) args;
+    NsHttp2StatsGet(&st);
+#endif
+    v8::Local<v8::Object> obj = v8::Object::New(iso);
+    auto put = [&](const char *k, unsigned long long v) {
+        obj->Set(ctx, v8s(iso, k), v8::Number::New(iso, static_cast<double>(v))).Check();
+    };
+    put("feed_ok", st.feed_ok);
+    put("feed_mem_recv_err", st.feed_mem_recv_err);
+    put("trysend_recoveries", st.trysend_recoveries);
+    put("sessions_created", st.sessions_created);
+    put("sessions_destroyed", st.sessions_destroyed);
+    put("streams_dispatched", st.streams_dispatched);
+    put("rst_stream_sent", st.rst_stream_sent);
+    put("session_send_fail", st.session_send_fail);
+    put("bytes_sent", st.bytes_sent);
+    put("ping_recv", st.ping_recv);
+    put("goaway_recv", st.goaway_recv);
+    put("rst_stream_recv", st.rst_stream_recv);
+    put("goaway_sent", st.goaway_sent);
+    put("ping_sent", st.ping_sent);
+    put("ping_ack_sent", st.ping_ack_sent);
+    put("defer_appends", st.defer_appends);
+    put("defer_max_depth", st.defer_max_depth);
+    put("trysend_drain_reads", st.trysend_drain_reads);
+    put("bytes_fed", st.bytes_fed);
+    args.GetReturnValue().Set(obj);
+}
+
+/*
+ * ns.http3.stats() — process-wide QUIC/HTTP/3 counters.
+ * ns.http3.stats("s1/nsssl") — counters for that driver only.
+ */
+static void JsHttp3Stats(const v8::FunctionCallbackInfo<v8::Value> &args) {
+    v8::Isolate *iso = args.GetIsolate();
+    v8::Local<v8::Context> ctx = iso->GetCurrentContext();
+
+#if HAVE_NGHTTP3
+    NsHttp3Stats st;
+
+    if (args.Length() >= 1 && args[0]->IsString()) {
+	std::string dn = V8ToString(iso, args[0]);
+	void *dp = Ns_DriverFindByFullName(dn.c_str());
+	if (dp == nullptr) {
+	    args.GetReturnValue().SetNull();
+	    return;
+	}
+	Ns_Http3DriverStatsSnapshot(dp, &st);
+    } else {
+	NsHttp3StatsGet(&st);
+    }
+    v8::Local<v8::Object> obj = v8::Object::New(iso);
+    auto put3 = [&](const char *k, unsigned long long v) {
+	obj->Set(ctx, v8s(iso, k), v8::Number::New(iso, static_cast<double>(v)))
+	    .Check();
+    };
+    put3("packets_recv", st.packets_recv);
+    put3("packets_sent", st.packets_sent);
+    put3("bytes_recv_udp", st.bytes_recv_udp);
+    put3("bytes_sent_udp", st.bytes_sent_udp);
+    put3("conn_accepted", st.conn_accepted);
+    put3("conn_closed", st.conn_closed);
+    put3("handshake_completed", st.handshake_completed);
+    put3("handshake_fail", st.handshake_fail);
+    put3("streams_dispatched", st.streams_dispatched);
+    put3("read_pkt_err", st.read_pkt_err);
+    put3("send_fail", st.send_fail);
+    put3("version_negotiation_sent", st.version_negotiation_sent);
+    put3("defer_appends", st.defer_appends);
+    put3("defer_max_depth", st.defer_max_depth);
+    args.GetReturnValue().Set(obj);
+#else
+    (void) ctx;
+    args.GetReturnValue().Set(v8::Object::New(iso));
+#endif
 }
 
 /* ns.cache.create(name, maxSize) */
@@ -4613,6 +4716,12 @@ static void BuildGlobalTemplate(v8::Isolate *isolate,
     driverObj->Set(isolate, "list",  v8::FunctionTemplate::New(isolate, JsDriverList));
     driverObj->Set(isolate, "query", v8::FunctionTemplate::New(isolate, JsDriverQuery));
     nsObj->Set(isolate, "driver", driverObj);
+    v8::Local<v8::ObjectTemplate> http2Obj = v8::ObjectTemplate::New(isolate);
+    http2Obj->Set(isolate, "stats", v8::FunctionTemplate::New(isolate, JsHttp2Stats));
+    nsObj->Set(isolate, "http2", http2Obj);
+    v8::Local<v8::ObjectTemplate> http3Obj = v8::ObjectTemplate::New(isolate);
+    http3Obj->Set(isolate, "stats", v8::FunctionTemplate::New(isolate, JsHttp3Stats));
+    nsObj->Set(isolate, "http3", http3Obj);
 
     /* ---- ns.memory ---- */
     v8::Local<v8::ObjectTemplate> memObj = v8::ObjectTemplate::New(isolate);

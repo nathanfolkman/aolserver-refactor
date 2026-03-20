@@ -77,7 +77,7 @@ set_target_properties(Tcl::Tcl PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${DEPS_INSTALL_DIR}/include")
 add_dependencies(Tcl::Tcl tcl_ep)
 
-# ── OpenSSL 3.3.2 ────────────────────────────────────────────────────────────
+# ── OpenSSL 3.5.0 (LTS; QUIC server APIs for HTTP/3 via ngtcp2 crypto_ossl) ───
 if(APPLE)
     set(OPENSSL_SSL_LIB "${DEPS_INSTALL_DIR}/lib/libssl.dylib")
     set(OPENSSL_CRYPTO_LIB "${DEPS_INSTALL_DIR}/lib/libcrypto.dylib")
@@ -98,8 +98,8 @@ endif()
 
 ExternalProject_Add(openssl_ep
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-    URL https://www.openssl.org/source/openssl-3.3.2.tar.gz
-    URL_HASH SHA256=2e8a40b01979afe8be0bbfb3de5dc1c6709fedb46d6c89c10da114ab5fc3d281
+    URL https://www.openssl.org/source/openssl-3.5.0.tar.gz
+    URL_HASH SHA256=344d0a79f1a9b08029b0744e2cc401a43f9c90acd1044d09a530b4885a8e9fc0
     INSTALL_DIR "${DEPS_INSTALL_DIR}"
     CONFIGURE_COMMAND <SOURCE_DIR>/Configure
         ${OPENSSL_TARGET}

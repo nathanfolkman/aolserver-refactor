@@ -96,6 +96,16 @@ Ns_ConnClose(Ns_Conn *conn)
     if (connPtr->sockPtr != NULL) {
 	Ns_GetTime(&connPtr->times.close);
 	keep = (conn->flags & NS_CONN_KEEPALIVE) ? 1 : 0;
+#if HAVE_NGHTTP2
+	if (conn->flags & NS_CONN_HTTP2) {
+	    keep = 1;
+	}
+#endif
+#if HAVE_NGHTTP3
+	if (conn->flags & NS_CONN_HTTP3) {
+	    keep = 1;
+	}
+#endif
 	NsSockClose(connPtr->sockPtr, keep);
 	connPtr->sockPtr = NULL;
 	connPtr->flags |= NS_CONN_CLOSED;
@@ -213,7 +223,9 @@ Ns_ConnFlushDirect(Ns_Conn *conn, char *buf, int len, int stream)
 	if (!stream) {
 	    hlen = len;
 	} else {
-	    if (conn->request->version > 1.0) {
+	    if (conn->request->version > 1.0
+		&& !(conn->flags & NS_CONN_HTTP2)
+		&& !(conn->flags & NS_CONN_HTTP3)) {
 		conn->flags |= NS_CONN_CHUNK;
 	    }
 	    hlen = -1;	/* NB: Surpress Content-length header. */
@@ -331,6 +343,32 @@ Ns_ConnSend(Ns_Conn *conn, struct iovec *bufs, int nbufs)
     }
     nbufs = n;
     bufs = sbufs;
+
+#if HAVE_NGHTTP2
+    if (connPtr->flags & NS_CONN_HTTP2) {
+	n = NsHttp2ConnSend(connPtr, bufs, nbufs);
+	if (n < 0) {
+	    return n;
+	}
+	connPtr->nContentSent += n;
+	/*
+	 * Do not run NS_FILTER_WRITE for HTTP/2: filters often issue another
+	 * Ns_ConnSend, but we submit exactly one nghttp2 response per stream.
+	 */
+	return n;
+    }
+#endif
+#if HAVE_NGHTTP3
+    if (connPtr->flags & NS_CONN_HTTP3) {
+	n = NsHttp3ConnSend(connPtr, bufs, nbufs);
+	if (n < 0) {
+	    return n;
+	}
+	connPtr->nContentSent += n;
+	return n;
+    }
+#endif
+
     n = nwrote = 0;
     while (towrite > 0) {
 	n = NsConnSend(conn, bufs, nbufs);

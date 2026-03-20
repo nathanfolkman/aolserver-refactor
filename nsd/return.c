@@ -270,7 +270,9 @@ Ns_ConnQueueHeaders(Ns_Conn *conn, int status)
 
     if (!(conn->flags & NS_CONN_SENTHDRS)) {
 	Ns_ConnSetStatus(conn, status);
-    	if (!(conn->flags & NS_CONN_SKIPHDRS)) {
+    	if (!(conn->flags & NS_CONN_SKIPHDRS)
+	    && !(conn->flags & NS_CONN_HTTP2)
+	    && !(conn->flags & NS_CONN_HTTP3)) {
 	    Ns_ConnConstructHeaders(conn, &connPtr->obuf);
 	    connPtr->nContentSent -= connPtr->obuf.length;
     	}

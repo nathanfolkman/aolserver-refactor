@@ -49,6 +49,7 @@
 #include <sys/stat.h>
 #include <ctype.h>
 #include <grp.h>
+#include <stdint.h>
 
 #ifdef HAVE_POLL
   #include <poll.h>
@@ -247,6 +248,57 @@ typedef struct AdpCode {
 
 struct NsServer;
 
+#if HAVE_NGHTTP2
+#include <stdatomic.h>
+
+/*
+ * Per-driver HTTP/2 counters (same fields as NsHttp2Stats in ns.h, same order).
+ */
+typedef struct NsHttp2StatsAtomic {
+    _Atomic unsigned long long feed_ok;
+    _Atomic unsigned long long feed_mem_recv_err;
+    _Atomic unsigned long long trysend_recoveries;
+    _Atomic unsigned long long sessions_created;
+    _Atomic unsigned long long sessions_destroyed;
+    _Atomic unsigned long long streams_dispatched;
+    _Atomic unsigned long long rst_stream_sent;
+    _Atomic unsigned long long session_send_fail;
+    _Atomic unsigned long long bytes_sent;
+    _Atomic unsigned long long ping_recv;
+    _Atomic unsigned long long goaway_recv;
+    _Atomic unsigned long long rst_stream_recv;
+    _Atomic unsigned long long goaway_sent;
+    _Atomic unsigned long long ping_sent;
+    _Atomic unsigned long long ping_ack_sent;
+    _Atomic unsigned long long defer_appends;
+    _Atomic unsigned long long defer_max_depth;
+    _Atomic unsigned long long trysend_drain_reads;
+    _Atomic unsigned long long bytes_fed;
+} NsHttp2StatsAtomic;
+#endif
+
+#if HAVE_NGHTTP3
+/*
+ * Per-driver HTTP/3 counters (same fields as NsHttp3Stats in ns.h, same order).
+ */
+typedef struct NsHttp3StatsAtomic {
+    _Atomic unsigned long long packets_recv;
+    _Atomic unsigned long long packets_sent;
+    _Atomic unsigned long long bytes_recv_udp;
+    _Atomic unsigned long long bytes_sent_udp;
+    _Atomic unsigned long long conn_accepted;
+    _Atomic unsigned long long conn_closed;
+    _Atomic unsigned long long handshake_completed;
+    _Atomic unsigned long long handshake_fail;
+    _Atomic unsigned long long streams_dispatched;
+    _Atomic unsigned long long read_pkt_err;
+    _Atomic unsigned long long send_fail;
+    _Atomic unsigned long long version_negotiation_sent;
+    _Atomic unsigned long long defer_appends;
+    _Atomic unsigned long long defer_max_depth;
+} NsHttp3StatsAtomic;
+#endif
+
 typedef struct Driver {
 
     /*
@@ -292,6 +344,35 @@ typedef struct Driver {
     int          maxheader;         /* Maximum total header length to read. */
     int		 maxinput;	    /* Maximum request bytes to read. */
 
+#if HAVE_NGHTTP2
+    unsigned int h2ReadBurst;	    /* Max SockRead iterations per driver wakeup (H2). */
+    NsHttp2StatsAtomic h2;	    /* HTTP/2 wire/session counters for this driver. */
+#endif
+#if HAVE_NGHTTP3
+    struct {
+	int enabled;
+	SOCKET udpSock;
+	int udpPidx;		    /* Poll index for udpSock this spin (-1 if none). */
+	void *sslCtx;		    /* SSL_CTX * for QUIC (separate from TCP nsssl ctx). */
+	void *handlers;		    /* H3HandlerSet * connection table. */
+	struct sockaddr_in localAddr;
+	unsigned char staticSecret[32];
+	uint64_t maxStreamsBidi;
+	uint64_t maxStreamsUni;
+	uint64_t maxData;
+	uint64_t maxStreamDataBidiLocal;
+	uint64_t maxStreamDataBidiRemote;
+	uint64_t maxStreamDataUni;
+	uint64_t maxIdleTimeout;    /* ngtcp2_duration (e.g. NGTCP2_SECONDS). */
+	uint32_t maxTxUdpPayload;
+	uint32_t qpackMaxDtable;
+	uint32_t qpackBlockedStreams;
+    } quic;
+    NsHttp3StatsAtomic h3stats;
+    struct Conn *h3PendingFirst;
+    struct Conn *h3PendingLast;
+#endif
+
     struct Sock *freeSockPtr;       /* Sock free list. */
     int     	 maxsock;	    /* Maximum open Sock's. */
     int     	 nactive;	    /* Number of active Sock's. */
@@ -309,6 +390,13 @@ typedef struct Driver {
     struct Conn *firstConnPtr;      /* First Conn waiting to run. */
     struct Conn *lastConnPtr;       /* Last Conn waiting to run. */
     struct Conn *freeConnPtr;       /* Conn's returning from conn threads. */
+
+    /*
+     * HTTP/2 requests completed in reader threads; driver thread drains
+     * this list into firstConnPtr (same limits as HTTP/1).
+     */
+    struct Conn *h2PendingFirst;
+    struct Conn *h2PendingLast;
 
     struct QueWait *freeQueWaitPtr;
 
@@ -336,12 +424,13 @@ typedef struct Driver {
 
 typedef struct Sock {
     /*
-     * Visible in Ns_Sock.
+     * Visible in Ns_Sock (layout must match include/ns.h).
      */
 
     struct Driver *drvPtr;
     SOCKET     sock;
     void      *arg;
+    int        app_protocol;
 
     /*
      * Private to Sock.
@@ -349,6 +438,11 @@ typedef struct Sock {
 
     struct Sock *nextPtr;
     struct Conn *connPtr;
+    void *http2; /* nghttp2_session * when app_protocol is H2 */
+    Ns_Mutex h2Lock; /* serializes nghttp2_session_* for this connection */
+    int h2NeedDriverPoll; /* TLS WANT_READ: return sock to driver instead of reader spin */
+    void *h2DeferFirst; /* H2Defer (http2.c): streams ready after full mem_recv */
+    void *h2DeferLast;
     struct sockaddr_in sa;
     unsigned int id;
     int		 state;
@@ -476,6 +570,22 @@ typedef struct Conn {
     int             tfd;        /* Temp fd for file-based content. */
     void	   *map;	/* Mmap'ed content, if any. */
     void	   *maparg;	/* Argument for NsUnMap. */
+
+    /*
+     * HTTP/2: multiplexed response on parent TLS connection.
+     * (Placed before roff so FreeConn memset clears these fields.)
+     */
+    void *http2_session; /* nghttp2_session * */
+    int32_t http2_stream_id;
+    int http2_response_started; /* 1 after first nghttp2_submit_response */
+#if HAVE_NGHTTP3
+    void *h3_handler; /* NsH3Conn * */
+    int64_t h3_stream_id;
+    int h3_response_started;
+    unsigned char *h3_write_buf;
+    size_t h3_write_len;
+    size_t h3_write_off;
+#endif
 
     /*
      * The following offsets are used to manage the 
@@ -887,6 +997,36 @@ extern int  NsConnSend(Ns_Conn *conn, struct iovec *bufs, int nbufs);
 extern void NsSockClose(Sock *sockPtr, int keep);
 extern int  NsPoll(struct pollfd *pfds, int nfds, Ns_Time *timeoutPtr);
 extern void NsFreeConn(Conn *connPtr);
+extern Conn *NsDriverAllocConn(Driver *drvPtr, Ns_Time *nowPtr, Sock *sockPtr);
+extern int NsDriverMapHostToServer(Conn *connPtr);
+extern void NsDriverH2PendingAppend(Driver *drvPtr, Conn *connPtr);
+#if HAVE_NGHTTP3
+extern void NsDriverH3PendingAppend(Driver *drvPtr, Conn *connPtr);
+extern void NsHttp3ServiceUdp(Driver *drv);
+extern void NsHttp3ProcessTimers(Driver *drv);
+extern int NsHttp3GetNextDeadline(Driver *drv, Ns_Time *outAbs);
+extern void NsHttp3DrainDeferred(Driver *drv);
+extern int NsHttp3DriverInit(Driver *drv, const char *configPath);
+extern void NsHttp3DriverShutdown(Driver *drv);
+extern void NsHttp3DriverStatsGet(Driver *drvPtr, NsHttp3Stats *outPtr);
+extern int NsHttp3ConnSend(Conn *connPtr, struct iovec *bufs, int nbufs);
+extern int NsHttp3ConnFlushDirect(Ns_Conn *conn, char *buf, int len);
+extern void NsHttp3ConnDetach(Conn *connPtr);
+extern SOCKET Ns_SockUdpListen(char *address, int port);
+#endif
+extern void NsDriverTrigger(Driver *drvPtr);
+extern void NsHttp2SockCleanup(Sock *sockPtr);
+extern Driver *NsDriverFind(const char *fullname);
+#if HAVE_NGHTTP2
+extern void NsHttp2DriverStatsGet(Driver *drvPtr, NsHttp2Stats *outPtr);
+#endif
+extern void NsHttp2EnsureSession(Sock *sockPtr);
+extern int NsHttp2Feed(Driver *drvPtr, Sock *sockPtr, Conn *connPtr,
+                       const unsigned char *data, size_t datalen);
+extern int NsHttp2TrySend(Sock *sockPtr);
+extern int NsHttp2WantReadInput(Sock *sockPtr);
+extern int NsHttp2ConnSend(Conn *connPtr, struct iovec *bufs, int nbufs);
+extern int NsHttp2ConnFlushDirect(Ns_Conn *conn, char *buf, int len, int stream);
 extern NsServer *NsGetServer(char *server);
 extern char *NsGetServers(void);
 extern NsServer *NsGetInitServer(void);

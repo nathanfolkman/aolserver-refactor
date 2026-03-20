@@ -34,13 +34,178 @@
  */
 
 #include "ns.h"
+#ifdef HAVE_NSCONFIG_H
+#include "nsconfig.h"
+#endif
+#include <errno.h>
+#include <sys/socket.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509.h>
+#include <poll.h>
+#include <stdlib.h>
 
 #define DRIVER_NAME "nsssl"
 
+/*
+ * Per-connection TLS state. OpenSSL SSL* is not thread-safe; the reader
+ * thread and worker threads may call DriverRecv/DriverSend concurrently
+ * on HTTP/2, so all SSL operations must hold lock.
+ */
+typedef struct NsSslSockArg {
+    SSL *ssl;
+    Ns_Mutex lock;
+} NsSslSockArg;
+
+static Ns_Mutex sslInitLock;
+static int sslInitLockReady;
+
+/*
+ * ALPN preference: offer h2 and http/1.1 (length-prefixed protocol ids).
+ */
+static const unsigned char alpn_prefs[] = {
+    2, 'h', '2',
+    8, 'h', 't', 't', 'p', '/', '1', '.', '1',
+};
+
+static int
+SslAlpnSelectCb(SSL *ssl, const unsigned char **out, unsigned char *outlen,
+                const unsigned char *in, unsigned int inlen, void *arg)
+{
+    unsigned char *proto;
+    unsigned int plen;
+
+    (void) ssl;
+    (void) arg;
+    if (SSL_select_next_proto(&proto, &plen, (unsigned char *) alpn_prefs,
+                              sizeof(alpn_prefs), (unsigned char *) in, inlen)
+        != OPENSSL_NPN_NEGOTIATED) {
+        return SSL_TLSEXT_ERR_NOACK;
+    }
+    *out = proto;
+    *outlen = (unsigned char) plen;
+    return SSL_TLSEXT_ERR_OK;
+}
+
 static Ns_DriverProc SSLProc;
+static int SslAcceptNonBlocking(SSL *ssl, SOCKET fd);
+
+/*
+ * Lazily create the SSL connection (under sslInitLock) and return the
+ * per-socket arg wrapper.
+ */
+static NsSslSockArg *
+SslEnsureConn(Ns_Sock *sock, Ns_Driver *driver)
+{
+    NsSslSockArg *sa;
+    SSL_CTX *ctx;
+    SSL *ssl;
+
+    sa = sock->arg;
+    if (sa != NULL) {
+	return sa;
+    }
+    /*
+     * Only hold sslInitLock around SSL_new and attaching sa to sock->arg.
+     * Do not run SslAcceptNonBlocking under this lock — it polls indefinitely
+     * and would block every other new TLS connection on the process.
+     */
+    Ns_MutexLock(&sslInitLock);
+    sa = sock->arg;
+    if (sa != NULL) {
+	Ns_MutexUnlock(&sslInitLock);
+	return sa;
+    }
+    ctx = (SSL_CTX *) driver->arg;
+    sa = calloc(1, sizeof(NsSslSockArg));
+    if (sa == NULL) {
+	Ns_MutexUnlock(&sslInitLock);
+	return NULL;
+    }
+    Ns_MutexInit(&sa->lock);
+    ssl = SSL_new(ctx);
+    if (ssl == NULL) {
+	Ns_Log(Error, "nsssl: SSL_new failed");
+	Ns_MutexDestroy(&sa->lock);
+	free(sa);
+	Ns_MutexUnlock(&sslInitLock);
+	return NULL;
+    }
+    SSL_set_fd(ssl, (int) sock->sock);
+    Ns_MutexUnlock(&sslInitLock);
+
+    if (!SslAcceptNonBlocking(ssl, sock->sock)) {
+	Ns_Log(Warning, "nsssl: SSL_accept failed");
+	SSL_free(ssl);
+	Ns_MutexDestroy(&sa->lock);
+	free(sa);
+	return NULL;
+    }
+
+    Ns_MutexLock(&sslInitLock);
+    if (sock->arg != NULL) {
+	/* Another path published first (should not happen for a new sock). */
+	Ns_MutexUnlock(&sslInitLock);
+	SSL_free(ssl);
+	Ns_MutexDestroy(&sa->lock);
+	free(sa);
+	return sock->arg;
+    }
+    sa->ssl = ssl;
+    sock->arg = sa;
+    if (sock->app_protocol == NS_APP_PROTO_UNKNOWN) {
+	const unsigned char *p;
+	unsigned int pl;
+
+	SSL_get0_alpn_selected(ssl, &p, &pl);
+	if (pl == 2u && p != NULL && p[0] == 'h' && p[1] == '2') {
+	    sock->app_protocol = NS_APP_PROTO_H2;
+	} else {
+	    sock->app_protocol = NS_APP_PROTO_HTTP11;
+	}
+    }
+    Ns_MutexUnlock(&sslInitLock);
+    return sa;
+}
+
+/*
+ * Complete TLS handshake on a non-blocking socket (DriverRecv uses the
+ * same fd in non-blocking mode).
+ */
+static int
+SslAcceptNonBlocking(SSL *ssl, SOCKET fd)
+{
+    int r, err;
+
+    for (;;) {
+        r = SSL_accept(ssl);
+        if (r > 0) {
+            return 1;
+        }
+        err = SSL_get_error(ssl, r);
+        if (err == SSL_ERROR_WANT_READ) {
+            struct pollfd p;
+
+            p.fd = fd;
+            p.events = POLLIN;
+            p.revents = 0;
+            if (poll(&p, 1, -1) <= 0) {
+                return 0;
+            }
+        } else if (err == SSL_ERROR_WANT_WRITE) {
+            struct pollfd p;
+
+            p.fd = fd;
+            p.events = POLLOUT;
+            p.revents = 0;
+            if (poll(&p, 1, -1) <= 0) {
+                return 0;
+            }
+        } else {
+            return 0;
+        }
+    }
+}
 
 /*
  *----------------------------------------------------------------------
@@ -66,6 +231,11 @@ NsSSL_ModInit(char *server, char *module)
     SSL_CTX *ctx;
     char *path, *cert, *key, *ciphers;
     int verify;
+
+    if (!sslInitLockReady) {
+	Ns_MutexInit(&sslInitLock);
+	sslInitLockReady = 1;
+    }
 
     path = Ns_ConfigGetPath(server, module, NULL);
 
@@ -94,6 +264,8 @@ NsSSL_ModInit(char *server, char *module)
     }
 
     SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
+
+    SSL_CTX_set_alpn_select_cb(ctx, SslAlpnSelectCb, NULL);
 
     if (SSL_CTX_use_certificate_chain_file(ctx, cert) != 1) {
         Ns_Log(Error, "%s: failed to load certificate: %s", module, cert);
@@ -142,7 +314,31 @@ NsSSL_ModInit(char *server, char *module)
     init.opts = NS_DRIVER_SSL;
     init.path = NULL;
 
-    return Ns_DriverInit(server, module, &init);
+    {
+	int drc;
+	Ns_DString fullds;
+
+	drc = Ns_DriverInit(server, module, &init);
+#if HAVE_NGHTTP3
+	if (drc == NS_OK) {
+	    void *drv;
+
+	    Ns_DStringInit(&fullds);
+	    Ns_DStringVarAppend(&fullds, server, "/", module, NULL);
+	    drv = Ns_DriverFindByFullName(fullds.string);
+	    Ns_DStringFree(&fullds);
+	    if (drv == NULL) {
+		Ns_Log(Error, "%s: Ns_DriverFindByFullName failed for HTTP/3",
+		    module);
+		return NS_ERROR;
+	    }
+	    if (Ns_Http3AttachDriver(drv, path) != NS_OK) {
+		return NS_ERROR;
+	    }
+	}
+#endif
+	return drc;
+    }
 }
 
 
@@ -169,72 +365,206 @@ static int
 SSLProc(Ns_DriverCmd cmd, Ns_Sock *sock, struct iovec *bufs, int nbufs)
 {
     Ns_Driver *driver = sock->driver;
-    SSL_CTX *ctx;
+    NsSslSockArg *sa;
     SSL *ssl;
     int n, total;
 
     switch (cmd) {
     case DriverRecv:
     case DriverSend:
-        /*
-         * On first I/O, create an SSL connection and perform the handshake.
-         */
+	sa = SslEnsureConn(sock, driver);
+	if (sa == NULL) {
+	    return -1;
+	}
+	ssl = sa->ssl;
+	Ns_MutexLock(&sa->lock);
+	total = 0;
+	do {
+	    if (cmd == DriverSend) {
+		n = SSL_write(ssl, bufs->iov_base, (int) bufs->iov_len);
+	    } else {
+		/*
+		 * Never ask SSL_read for more plaintext than OpenSSL has already
+		 * decrypted. With a huge iovec (AOLserver may use ~1MiB), OpenSSL
+		 * 3.3 on Darwin can return SSL_ERROR_SYSCALL / errno 0 while
+		 * SSL_pending() and SSL_peek() still show data; clamping the read
+		 * size to SSL_pending() breaks that stall (h2spec generic/2/1).
+		 */
+		{
+		    int want = (int) bufs->iov_len;
+		    int pend = SSL_pending(ssl);
 
-        if (sock->arg == NULL) {
-            ctx = (SSL_CTX *) driver->arg;
-            ssl = SSL_new(ctx);
-            if (ssl == NULL) {
-                Ns_Log(Error, "nsssl: SSL_new failed");
-                return -1;
-            }
-            SSL_set_fd(ssl, (int) sock->sock);
-            if (SSL_accept(ssl) <= 0) {
-                Ns_Log(Warning, "nsssl: SSL_accept failed");
-                SSL_free(ssl);
-                return -1;
-            }
-            sock->arg = ssl;
-        }
+		    if (cmd == DriverRecv && pend > 0 && want > pend) {
+			want = pend;
+		    }
+		    n = SSL_read(ssl, bufs->iov_base, want);
+		}
+	    }
+	    if (n > 0) {
+		total += n;
+		/*
+		 * Drain decrypted application data already in the SSL read BIO.
+		 * Without this, poll() may stay idle (no TCP bytes) while OpenSSL
+		 * still holds a complete follow-on record; HTTP/2 clients then
+		 * stall or RST (h2spec generic/2, PRIORITY + PING after SETTINGS).
+		 */
+		if (cmd == DriverRecv && nbufs == 1) {
+		    char *base = bufs->iov_base;
+		    int cap = (int) bufs->iov_len;
 
-        ssl = (SSL *) sock->arg;
-        total = 0;
-        do {
-            if (cmd == DriverSend) {
-                n = SSL_write(ssl, bufs->iov_base, (int) bufs->iov_len);
-            } else {
-                n = SSL_read(ssl, bufs->iov_base, (int) bufs->iov_len);
-            }
-            if (n < 0 && total > 0) {
-                n = 0;
-            }
-            ++bufs;
-            total += n;
-        } while (n > 0 && --nbufs > 0);
-        n = total;
-        break;
+		    while (total < cap && SSL_has_pending(ssl)) {
+			int room = cap - total;
+			int pend = SSL_pending(ssl);
+
+			if (pend > 0 && room > pend) {
+			    room = pend;
+			}
+			n = SSL_read(ssl, base + total, room);
+			if (n > 0) {
+			    total += n;
+			    continue;
+			}
+			{
+			    int sslErr = SSL_get_error(ssl, n);
+
+			    if (sslErr == SSL_ERROR_WANT_READ
+				    || sslErr == SSL_ERROR_WANT_WRITE) {
+				break;
+			    }
+			    if (n == 0 && sslErr == SSL_ERROR_ZERO_RETURN) {
+				break;
+			    }
+			    if (n == 0 && sslErr == SSL_ERROR_SYSCALL
+				    && errno == 0) {
+				break;
+			    }
+			    total = -1;
+			    break;
+			}
+		    }
+		}
+	    } else {
+		int sslErr = SSL_get_error(ssl, n);
+
+		if (sslErr == SSL_ERROR_WANT_READ
+			|| sslErr == SSL_ERROR_WANT_WRITE) {
+		    break;
+		}
+		/*
+		 * SSL_read() returns 0 for end-of-stream (close_notify). Do not
+		 * lump that with hard errors; driver maps this to E_CLOSE.
+		 */
+		if (cmd == DriverRecv && n == 0
+			&& sslErr == SSL_ERROR_ZERO_RETURN) {
+		    total = NS_DRIVER_RECV_TLS_EOF;
+		    break;
+		}
+		/*
+		 * TCP FIN/RST without TLS close_notify is often reported as
+		 * SSL_ERROR_SYSCALL with errno 0. On Darwin, the same signature
+		 * has been observed while OpenSSL still reports pending read data
+		 * (SSL_has_pending / SSL_pending). Mapping that to EOF closes the
+		 * connection before the HTTP/2 preface reaches nghttp2; return 0
+		 * bytes from this recv instead (same as WANT_READ) and let the next
+		 * poll/read retry.
+		 */
+		if (cmd == DriverRecv && n == 0
+			&& sslErr == SSL_ERROR_SYSCALL && errno == 0) {
+		    if (SSL_has_pending(ssl) || SSL_pending(ssl) > 0) {
+			break;
+		    }
+		    /*
+		     * More TLS records may be waiting in the TCP buffer while
+		     * OpenSSL reports SYSCALL/0 (Darwin). Avoid false EOF so the
+		     * driver polls again (h2spec PING after SETTINGS, etc.).
+		     */
+		    {
+			int fd = SSL_get_fd(ssl);
+			unsigned char byte;
+
+			if (fd >= 0) {
+			    ssize_t pr = recv(fd, (char *) &byte, 1, MSG_PEEK);
+
+			    if (pr > 0) {
+				break;
+			    }
+			    if (pr == 0) {
+				total = NS_DRIVER_RECV_TLS_EOF;
+				break;
+			    }
+			    /* pr < 0: EINTR/EAGAIN/etc. — not a confirmed TCP close */
+			    break;
+			}
+		    }
+		    total = NS_DRIVER_RECV_TLS_EOF;
+		    break;
+		}
+		if (n < 0 && total > 0 && cmd == DriverSend) {
+		    break;
+		}
+		total = -1;
+		break;
+	    }
+	    ++bufs;
+	} while (n > 0 && --nbufs > 0);
+	n = total;
+	Ns_MutexUnlock(&sa->lock);
+	break;
 
     case DriverKeep:
-        ssl = (SSL *) sock->arg;
-        if (ssl != NULL) {
-            n = (SSL_shutdown(ssl) >= 0) ? 0 : -1;
-        } else {
-            n = -1;
-        }
-        break;
+	sa = sock->arg;
+	if (sa != NULL) {
+	    Ns_MutexLock(&sa->lock);
+	    ssl = sa->ssl;
+	    if (ssl != NULL && sock->app_protocol != NS_APP_PROTO_H2) {
+		n = (SSL_shutdown(ssl) >= 0) ? 0 : -1;
+	    } else if (ssl != NULL) {
+		n = 0;
+	    } else {
+		n = -1;
+	    }
+	    Ns_MutexUnlock(&sa->lock);
+	} else {
+	    n = -1;
+	}
+	break;
 
     case DriverClose:
-        ssl = (SSL *) sock->arg;
-        if (ssl != NULL) {
-            SSL_shutdown(ssl);
-            SSL_free(ssl);
-            sock->arg = NULL;
-        }
-        n = 0;
-        break;
+	sa = sock->arg;
+	if (sa != NULL) {
+	    Ns_MutexLock(&sa->lock);
+	    ssl = sa->ssl;
+	    if (ssl != NULL) {
+		SSL_shutdown(ssl);
+		SSL_free(ssl);
+		sa->ssl = NULL;
+	    }
+	    Ns_MutexUnlock(&sa->lock);
+	    Ns_MutexDestroy(&sa->lock);
+	    free(sa);
+	    sock->arg = NULL;
+	}
+	sock->app_protocol = NS_APP_PROTO_UNKNOWN;
+	n = 0;
+	break;
+
+    case DriverTlsAppPending:
+	sa = sock->arg;
+	n = 0;
+	if (sa != NULL) {
+	    Ns_MutexLock(&sa->lock);
+	    ssl = sa->ssl;
+	    if (ssl != NULL
+		    && (SSL_pending(ssl) > 0 || SSL_has_pending(ssl))) {
+		n = 1;
+	    }
+	    Ns_MutexUnlock(&sa->lock);
+	}
+	break;
 
     default:
-        n = -1;
-        break;
+	n = -1;
+	break;
     }
     return n;
 }

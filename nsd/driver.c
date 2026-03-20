@@ -38,6 +38,67 @@ static const char *RCSID = "@(#) $Header: /Users/dossy/Desktop/cvs/aolserver/nsd
 
 #include "nsd.h"
 
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#if HAVE_NGHTTP2
+#include <sys/socket.h>
+#endif
+
+#if HAVE_NGHTTP2
+# include <stdio.h>
+# include <stdlib.h>
+# include <string.h>
+
+/*
+ * When AOLSERVER_H2_DEBUG is set in the environment (any non-empty value
+ * other than "0"), emit SockClose diagnostics to stderr for HTTP/2 TLS
+ * troubleshooting (e.g. h2spec / Python h2 clients).
+ */
+static int
+H2DriverDebugEnv(void)
+{
+    static int cache = -1;
+
+    if (cache < 0) {
+	const char *e = getenv("AOLSERVER_H2_DEBUG");
+
+	if (e == NULL || e[0] == '\0' || strcmp(e, "0") == 0) {
+	    cache = 0;
+	} else {
+	    cache = 1;
+	}
+    }
+    return cache;
+}
+
+/*
+ * Raw TCP peek for HTTP/2: poll sometimes omits POLLIN while ciphertext
+ * waits (Darwin + TLS). Only used after nghttp2 session exists.
+ */
+static int
+H2SockHasTcpInput(Sock *sockPtr)
+{
+    unsigned char b;
+    ssize_t n;
+
+    if (sockPtr->sock == INVALID_SOCKET) {
+	return 0;
+    }
+    n = recv(sockPtr->sock, (char *) &b, 1, MSG_PEEK);
+    return (n > 0) ? 1 : 0;
+}
+
+static int
+H2SockHasTlsAppPending(Sock *sockPtr)
+{
+    if ((sockPtr->drvPtr->opts & NS_DRIVER_SSL) == 0) {
+	return 0;
+    }
+    return (*sockPtr->drvPtr->proc)(DriverTlsAppPending, (Ns_Sock *) sockPtr, NULL,
+	    0) > 0;
+}
+#endif
+
 /*
  * The following are valid Sock states.
  */
@@ -122,6 +183,7 @@ typedef struct PollData {
 } PollData;
 
 #define PollIn(ppd,i)		((ppd)->pfds[(i)].revents & POLLIN)
+#define PollOut(ppd,i)		((ppd)->pfds[(i)].revents & POLLOUT)
 
 /*
  * The following structure defines a Host header to server mappings.
@@ -341,6 +403,10 @@ Ns_DriverInit(char *server, char *module, Ns_DriverInitData *init)
     Ns_DStringInit(&ds);
     drvPtr = ns_calloc(1, sizeof(Driver));
     drvPtr->flags = DRIVER_STOPPED;
+#if HAVE_NGHTTP3
+    drvPtr->quic.udpSock = INVALID_SOCKET;
+    drvPtr->quic.udpPidx = -1;
+#endif
     Ns_MutexSetName2(&drvPtr->lock, "ns:drv", module);
     if (ns_sockpair(drvPtr->trigger) != 0) {
 	Ns_Fatal("ns_sockpair() failed: %s", ns_sockstrerror(ns_sockerrno));
@@ -381,6 +447,12 @@ Ns_DriverInit(char *server, char *module, Ns_DriverInitData *init)
 	n = socktimeout; /* Use previous socktimeout option. */
     }
     drvPtr->recvwait = _MAX(n, 1);
+#if HAVE_NGHTTP2
+    drvPtr->h2ReadBurst = 16u;
+    if (Ns_ConfigGetInt(path, "h2readburst", &n) && n >= 1 && n <= 65535) {
+	drvPtr->h2ReadBurst = (unsigned int) n;
+    }
+#endif
     if (!Ns_ConfigGetInt(path, "backlog", &n) || n < 1) {
 	n = 5;		/* 5 pending connections. */
     }
@@ -423,9 +495,10 @@ Ns_DriverInit(char *server, char *module, Ns_DriverInitData *init)
     drvPtr->freeSockPtr = NULL;
     sockPtr = ns_malloc(sizeof(Sock) * drvPtr->maxsock);
     for (n = 0; n < drvPtr->maxsock; ++n) {
-        sockPtr->nextPtr = drvPtr->freeSockPtr;
-        drvPtr->freeSockPtr = sockPtr;
-        ++sockPtr;
+	Ns_MutexInit(&sockPtr->h2Lock);
+	sockPtr->nextPtr = drvPtr->freeSockPtr;
+	drvPtr->freeSockPtr = sockPtr;
+	++sockPtr;
     }
 
     /*
@@ -726,6 +799,25 @@ NsWaitDriversShutdown(Ns_Time *toPtr)
  *----------------------------------------------------------------------
  */
 
+Driver *
+NsDriverFind(const char *fullname)
+{
+    Driver *d;
+
+    for (d = firstDrvPtr; d != NULL; d = d->nextPtr) {
+	if (STREQ(fullname, d->fullname)) {
+	    return d;
+	}
+    }
+    return NULL;
+}
+
+void *
+Ns_DriverFindByFullName(const char *fullname)
+{
+    return (void *) NsDriverFind(fullname);
+}
+
 int
 NsTclDriverObjCmd(ClientData dummy, Tcl_Interp *interp, int objc, Tcl_Obj **objv)
 {
@@ -763,13 +855,7 @@ NsTclDriverObjCmd(ClientData dummy, Tcl_Interp *interp, int objc, Tcl_Obj **objv
             return TCL_ERROR;
 	}
 	fullname = Tcl_GetString(objv[2]);
-	drvPtr = firstDrvPtr;
-	while (drvPtr != NULL) {
-	    if (STREQ(fullname, drvPtr->fullname)) {
-		break;
-	    }
-	    drvPtr = drvPtr->nextPtr;
-	}
+	drvPtr = NsDriverFind(fullname);
 	if (drvPtr == NULL) {
 	    Tcl_AppendResult(interp, "no such driver: ", fullname, NULL);
 	    return TCL_ERROR;
@@ -853,6 +939,31 @@ NsSockClose(Sock *sockPtr, int keep)
      */
 
     if (sockPtr->state != SOCK_RUNNING) {
+#if HAVE_NGHTTP2
+	/*
+	 * H2: physical socket stays READWAIT while worker threads handle
+	 * stream Conns; keepalive must run the DriverKeep path, not CLOSEREQ.
+	 */
+	if (keep && sock->app_protocol == NS_APP_PROTO_H2
+		&& drvPtr->keepwait > 0
+		&& (*drvPtr->proc)(DriverKeep, sock, NULL, 0) == 0) {
+	    /*
+	     * Reader will return this sock to the driver's poll list via
+	     * h2NeedDriverPoll; do not push onto readSockPtr (avoids duplicate
+	     * reader work on the same socket).
+	     */
+	    SockState(sockPtr, SOCK_READWAIT);
+	    TriggerDriver(drvPtr);
+	    return;
+	}
+#endif
+#if HAVE_NGHTTP3
+	if (keep && sock->app_protocol == NS_APP_PROTO_H3) {
+	    SockState(sockPtr, SOCK_READWAIT);
+	    TriggerDriver(drvPtr);
+	    return;
+	}
+#endif
 	SockState(sockPtr, SOCK_CLOSEREQ);
 	return;
     }
@@ -987,6 +1098,9 @@ DriverThread(void *arg)
     pdata.timeoutPtr = NULL;
     stop = (flags & DRIVER_SHUTDOWN);
     while (!stop || drvPtr->nactive) {
+#if HAVE_NGHTTP2
+	Sock *h2ReaderReturnPtr = NULL;
+#endif
 
 	/*
          * Poll the trigger pipe and, if a Sock structure is available,
@@ -1009,8 +1123,20 @@ DriverThread(void *arg)
 	sockPtr = waitPtr;
         while (sockPtr != NULL) {
             if (sockPtr->state != SOCK_QUEWAIT) {
+#if HAVE_NGHTTP2
+		{
+		    short pevents = POLLIN;
+
+		    if (((Ns_Sock *) sockPtr)->app_protocol == NS_APP_PROTO_H2) {
+			pevents |= POLLOUT;
+		    }
+		    sockPtr->pidx = Poll(&pdata, sockPtr->sock, pevents,
+					 &sockPtr->timeout);
+		}
+#else
             	sockPtr->pidx = Poll(&pdata, sockPtr->sock, POLLIN,
 				     &sockPtr->timeout);
+#endif
 	    } else {
 		/* NB: No client timeout with active queue wait events. */
             	sockPtr->pidx = Poll(&pdata, sockPtr->sock, POLLIN, NULL);
@@ -1025,11 +1151,33 @@ DriverThread(void *arg)
             sockPtr = sockPtr->nextPtr;
         }
 
+#if HAVE_NGHTTP3
+	drvPtr->quic.udpPidx = -1;
+	if (drvPtr->quic.enabled && drvPtr->quic.udpSock != INVALID_SOCKET) {
+	    drvPtr->quic.udpPidx = Poll(&pdata, drvPtr->quic.udpSock, POLLIN,
+		NULL);
+	}
+#endif
+
 	/*
 	 * Poll, drain the trigger pipe if necessary, and get current time.
 	 */
 
 	++drvPtr->stats.spins;
+#if HAVE_NGHTTP3
+	{
+	    Ns_Time quicAbs;
+	    int haveQ;
+
+	    haveQ = (drvPtr->quic.enabled && drvPtr->quic.handlers != NULL
+		    && NsHttp3GetNextDeadline(drvPtr, &quicAbs));
+	    if (haveQ
+		    && (pdata.timeoutPtr == NULL
+			|| Ns_DiffTime(&quicAbs, pdata.timeoutPtr, NULL) < 0)) {
+		pdata.timeoutPtr = &quicAbs;
+	    }
+	}
+#endif
 	n = NsPoll(pdata.pfds, pdata.nfds, pdata.timeoutPtr);
 	if (PollIn(&pdata, tidx)
 		&& recv(drvPtr->trigger[0], drain, sizeof(drain), 0) <= 0) {
@@ -1037,6 +1185,17 @@ DriverThread(void *arg)
 		     ns_sockstrerror(ns_sockerrno));
 	}
         Ns_GetTime(&now);
+
+#if HAVE_NGHTTP3
+	if (drvPtr->quic.udpPidx >= 0 && PollIn(&pdata, drvPtr->quic.udpPidx)) {
+	    NsHttp3ServiceUdp(drvPtr);
+	    NsHttp3DrainDeferred(drvPtr);
+	}
+	if (drvPtr->quic.enabled && drvPtr->quic.handlers != NULL) {
+	    NsHttp3ProcessTimers(drvPtr);
+	    NsHttp3DrainDeferred(drvPtr);
+	}
+#endif
 
 	/*
          * Get current flags, free conns, closing socks, and socks returning
@@ -1051,6 +1210,19 @@ DriverThread(void *arg)
         drvPtr->closeSockPtr = NULL;
         while ((sockPtr = drvPtr->runSockPtr) != NULL) {
             drvPtr->runSockPtr = sockPtr->nextPtr;
+#if HAVE_NGHTTP2
+	    /*
+	     * Reader returns TLS sockets still in SOCK_READWAIT (e.g. HTTP/2
+	     * after SSL WANT_READ or h2NeedDriverPoll). preqSockPtr processing
+	     * only allows SOCK_PREQUE; anything else is closed, so H2 must go
+	     * back on the driver's poll wait list, not through pre-queue.
+	     */
+	    if (((Ns_Sock *) sockPtr)->app_protocol == NS_APP_PROTO_H2
+		    && sockPtr->state == SOCK_READWAIT) {
+		SockPush(sockPtr, &h2ReaderReturnPtr);
+		continue;
+	    }
+#endif
             SockPush(sockPtr, &preqSockPtr);
         }
 	Ns_MutexUnlock(&drvPtr->lock);
@@ -1075,11 +1247,62 @@ DriverThread(void *arg)
 
     	    if ((sockPtr = connPtr->sockPtr) != NULL) {
         	connPtr->sockPtr = NULL;
-		SockState(sockPtr, SOCK_CLOSEWAIT);
-		SockPush(sockPtr, &closePtr);
+		/*
+		 * HTTP/2 stream Conns borrow the reader's TLS Sock; never
+		 * transition it to CLOSEWAIT when the stream worker exits.
+		 * HTTP/3 uses a placeholder Sock (no TCP fd) per QUIC conn.
+		 */
+		if (1
+#if HAVE_NGHTTP2
+			&& !(connPtr->flags & NS_CONN_HTTP2)
+#endif
+#if HAVE_NGHTTP3
+			&& !(connPtr->flags & NS_CONN_HTTP3)
+#endif
+			) {
+		    SockState(sockPtr, SOCK_CLOSEWAIT);
+		    SockPush(sockPtr, &closePtr);
+		}
     	    }
             FreeConn(connPtr);
         }
+
+	/*
+	 * Drain HTTP/2 connections queued from reader threads.
+	 */
+
+	{
+	    Conn *h2c, *h2next;
+
+	    Ns_MutexLock(&drvPtr->lock);
+	    h2c = drvPtr->h2PendingFirst;
+	    drvPtr->h2PendingFirst = drvPtr->h2PendingLast = NULL;
+	    Ns_MutexUnlock(&drvPtr->lock);
+	    while (h2c != NULL) {
+		h2next = h2c->nextPtr;
+		h2c->nextPtr = NULL;
+		AppendConn(drvPtr, h2c);
+		h2c = h2next;
+	    }
+	}
+
+#if HAVE_NGHTTP3
+	{
+	    Conn *h3c, *h3next;
+
+	    Ns_MutexLock(&drvPtr->lock);
+	    h3c = drvPtr->h3PendingFirst;
+	    drvPtr->h3PendingFirst = drvPtr->h3PendingLast = NULL;
+	    Ns_MutexUnlock(&drvPtr->lock);
+	    while (h3c != NULL) {
+		h3next = h3c->nextPtr;
+		h3c->nextPtr = NULL;
+		AppendConn(drvPtr, h3c);
+		h3c = h3next;
+	    }
+	    NsHttp3DrainDeferred(drvPtr);
+	}
+#endif
 
         /*
          * Process ready sockets.
@@ -1130,29 +1353,65 @@ DriverThread(void *arg)
                  * Read connection for more input.
                  */
 
-	    	if (!PollIn(&pdata, sockPtr->pidx)) {
-                    if (Ns_DiffTime(&sockPtr->timeout, &now, NULL) <= 0
-				    || stop) {
-                        /* Timeout waiting for input. */
-                        SockClose(sockPtr);
-		    } else {
-		    	SockPush(sockPtr, &waitPtr);
+#if HAVE_NGHTTP2
+		/*
+		 * Flush pending HTTP/2 frames (SETTINGS, ACKs, PING) before
+		 * scheduling another read. Do not gate on PollOut: some stacks
+		 * omit POLLOUT in revents while TLS still has outbound data,
+		 * which starves the peer and yields TCP EOF (h2spec generic/2/1).
+		 */
+		if (((Ns_Sock *) sockPtr)->app_protocol == NS_APP_PROTO_H2) {
+		    NsHttp2EnsureSession(sockPtr);
+		    if (sockPtr->http2 != NULL) {
+			/*
+			 * Best-effort flush only. TrySend may return -1 while TLS
+			 * still needs another read/write turn (same as h2ReaderReturn
+			 * below); closing here drops follow-on frames (e.g. PING after
+			 * PRIORITY) and breaks h2spec generic/2/1.
+			 */
+			(void) NsHttp2TrySend(sockPtr);
 		    }
-	    	} else {
-                    /* Input now available */
-		    if (sockPtr->connPtr->ibuf.length == 0) {
-			sockPtr->connPtr->times.read = now;
+		}
+#endif
+	    	{
+		    int pollIn = PollIn(&pdata, sockPtr->pidx);
+
+#if HAVE_NGHTTP2
+		    /*
+		     * ALPN is already h2; http2 session may not exist yet, but if
+		     * ciphertext is waiting we must schedule a read (h2spec splits
+		     * preface and SETTINGS across TLS records).
+		     */
+		    if (!pollIn && ((Ns_Sock *) sockPtr)->app_protocol == NS_APP_PROTO_H2
+			    && (H2SockHasTcpInput(sockPtr)
+				    || H2SockHasTlsAppPending(sockPtr))) {
+			pollIn = 1;
 		    }
-		    if (!(drvPtr->opts & NS_DRIVER_ASYNC)) {
-                        /* Queue for read by reader threads. */
-                        SockPush(sockPtr, &readSockPtr);
-		    } else {
-                        /* Read directly. */
-		    	SockRead(sockPtr);
-			if (sockPtr->state == SOCK_READWAIT) {
-                            SockWait(sockPtr, &now, drvPtr->recvwait, &waitPtr);
+#endif
+		    if (!pollIn) {
+			if (Ns_DiffTime(&sockPtr->timeout, &now, NULL) <= 0
+				|| stop) {
+			    /* Timeout waiting for input. */
+			    SockClose(sockPtr);
 			} else {
-                            SockPush(sockPtr, &preqSockPtr);
+			    SockPush(sockPtr, &waitPtr);
+			}
+		    } else {
+			/* Input now available */
+			if (sockPtr->connPtr->ibuf.length == 0) {
+			    sockPtr->connPtr->times.read = now;
+			}
+			if (!(drvPtr->opts & NS_DRIVER_ASYNC)) {
+			    /* Queue for read by reader threads. */
+			    SockPush(sockPtr, &readSockPtr);
+			} else {
+			    /* Read directly. */
+			    SockRead(sockPtr);
+			    if (sockPtr->state == SOCK_READWAIT) {
+				SockWait(sockPtr, &now, drvPtr->recvwait, &waitPtr);
+			    } else {
+				SockPush(sockPtr, &preqSockPtr);
+			    }
 			}
 		    }
 		}
@@ -1168,6 +1427,35 @@ DriverThread(void *arg)
 	    }
 	    sockPtr = nextPtr;
 	}
+
+#if HAVE_NGHTTP2
+	/*
+	 * HTTP/2 TLS sockets the reader put back in READWAIT were not part of
+	 * this iteration's poll set; queue them for the next NsPoll so pidx
+	 * matches pdata (avoids stale PollIn/PollOut).
+	 */
+	while ((sockPtr = h2ReaderReturnPtr) != NULL) {
+	    h2ReaderReturnPtr = sockPtr->nextPtr;
+	    /*
+	     * Reader was not in this pollfd set; we still must flush any
+	     * nghttp2 output (PING ACK, SETTINGS) before waiting for the next
+	     * NsPoll. Otherwise h2spec and other clients time out while the
+	     * socket is idle until the following driver spin.
+	     */
+	    if (((Ns_Sock *) sockPtr)->app_protocol == NS_APP_PROTO_H2) {
+		NsHttp2EnsureSession(sockPtr);
+		if (sockPtr->http2 != NULL) {
+		    /*
+		     * Best-effort flush; do not close on failure — TrySend may
+		     * return -1 from inner DriverRecv (e.g. TLS WANT_READ)
+		     * while the connection is still healthy (h2spec handshake).
+		     */
+		    (void) NsHttp2TrySend(sockPtr);
+		}
+	    }
+	    SockWait(sockPtr, &now, drvPtr->recvwait, &waitPtr);
+	}
+#endif
 
 	/*
          * Move Sock's to the reader threads if necessary.
@@ -1205,7 +1493,8 @@ DriverThread(void *arg)
             if (!stop && sockPtr->state == SOCK_READWAIT) {
 		sockPtr->connPtr = AllocConn(drvPtr, &now, sockPtr);
                 SockWait(sockPtr, &now, drvPtr->keepwait, &waitPtr);
-            } else if (!drvPtr->closewait || shutdown(sockPtr->sock, 1) != 0) {
+            } else if (sockPtr->sock == INVALID_SOCKET
+		    || !drvPtr->closewait || shutdown(sockPtr->sock, 1) != 0) {
                 /* Graceful close diabled or shutdown() failed. */
                 SockClose(sockPtr);
             } else {
@@ -1271,6 +1560,45 @@ DriverThread(void *arg)
 	    nextConnPtr = connPtr->nextPtr;
             sockPtr = connPtr->sockPtr;
             limitsPtr = connPtr->limitsPtr;
+#if HAVE_NGHTTP2
+	    /*
+	     * HTTP/2 stream requests share one TLS socket (READWAIT) with the
+	     * reader's primary Conn. Do not change sock state or sock->connPtr;
+	     * only apply limits and queue the stream Conn.
+	     */
+	    if (connPtr->flags & NS_CONN_HTTP2) {
+		Ns_MutexLock(&limitsPtr->lock);
+		if (limitsPtr->nrunning < limitsPtr->maxrun) {
+		    ++limitsPtr->nrunning;
+		    Ns_MutexUnlock(&limitsPtr->lock);
+		    connPtr->times.run = now;
+		    NsQueueConn(connPtr);
+		    ++drvPtr->stats.queued;
+		} else {
+		    Ns_MutexUnlock(&limitsPtr->lock);
+		    AppendConn(drvPtr, connPtr);
+		}
+		connPtr = nextConnPtr;
+		continue;
+	    }
+#endif
+#if HAVE_NGHTTP3
+	    if (connPtr->flags & NS_CONN_HTTP3) {
+		Ns_MutexLock(&limitsPtr->lock);
+		if (limitsPtr->nrunning < limitsPtr->maxrun) {
+		    ++limitsPtr->nrunning;
+		    Ns_MutexUnlock(&limitsPtr->lock);
+		    connPtr->times.run = now;
+		    NsQueueConn(connPtr);
+		    ++drvPtr->stats.queued;
+		} else {
+		    Ns_MutexUnlock(&limitsPtr->lock);
+		    AppendConn(drvPtr, connPtr);
+		}
+		connPtr = nextConnPtr;
+		continue;
+	    }
+#endif
             Ns_MutexLock(&limitsPtr->lock);
 	    if (sockPtr->state == SOCK_RUNWAIT) {
 		--limitsPtr->nwaiting;
@@ -1361,6 +1689,75 @@ dropped:
 		drvPtr->stats.dropped, drvPtr->stats.overflow,
 		drvPtr->stats.timeout);
 	    Tcl_DStringEndSublist(drvPtr->queryPtr);
+#if HAVE_NGHTTP2
+	    {
+		NsHttp2Stats h2st;
+
+		NsHttp2DriverStatsGet(drvPtr, &h2st);
+		Tcl_DStringAppendElement(drvPtr->queryPtr, "http2");
+		Tcl_DStringStartSublist(drvPtr->queryPtr);
+		Ns_DStringPrintf(drvPtr->queryPtr,
+		    "feed_ok %llu feed_mem_recv_err %llu trysend_recoveries %llu "
+		    "sessions_created %llu sessions_destroyed %llu "
+		    "streams_dispatched %llu rst_stream_sent %llu "
+		    "session_send_fail %llu bytes_sent %llu ping_recv %llu "
+		    "goaway_recv %llu rst_stream_recv %llu goaway_sent %llu "
+		    "ping_sent %llu ping_ack_sent %llu defer_appends %llu "
+		    "defer_max_depth %llu trysend_drain_reads %llu bytes_fed %llu",
+		    (unsigned long long) h2st.feed_ok,
+		    (unsigned long long) h2st.feed_mem_recv_err,
+		    (unsigned long long) h2st.trysend_recoveries,
+		    (unsigned long long) h2st.sessions_created,
+		    (unsigned long long) h2st.sessions_destroyed,
+		    (unsigned long long) h2st.streams_dispatched,
+		    (unsigned long long) h2st.rst_stream_sent,
+		    (unsigned long long) h2st.session_send_fail,
+		    (unsigned long long) h2st.bytes_sent,
+		    (unsigned long long) h2st.ping_recv,
+		    (unsigned long long) h2st.goaway_recv,
+		    (unsigned long long) h2st.rst_stream_recv,
+		    (unsigned long long) h2st.goaway_sent,
+		    (unsigned long long) h2st.ping_sent,
+		    (unsigned long long) h2st.ping_ack_sent,
+		    (unsigned long long) h2st.defer_appends,
+		    (unsigned long long) h2st.defer_max_depth,
+		    (unsigned long long) h2st.trysend_drain_reads,
+		    (unsigned long long) h2st.bytes_fed);
+		Tcl_DStringEndSublist(drvPtr->queryPtr);
+	    }
+#endif
+#if HAVE_NGHTTP3
+	    {
+		NsHttp3Stats h3st;
+
+		NsHttp3DriverStatsGet(drvPtr, &h3st);
+		Tcl_DStringAppendElement(drvPtr->queryPtr, "http3");
+		Tcl_DStringStartSublist(drvPtr->queryPtr);
+		Ns_DStringPrintf(drvPtr->queryPtr,
+		    "packets_recv %llu packets_sent %llu "
+		    "bytes_recv_udp %llu bytes_sent_udp %llu "
+		    "conn_accepted %llu conn_closed %llu "
+		    "handshake_completed %llu handshake_fail %llu "
+		    "streams_dispatched %llu read_pkt_err %llu send_fail %llu "
+		    "version_negotiation_sent %llu defer_appends %llu "
+		    "defer_max_depth %llu",
+		    (unsigned long long) h3st.packets_recv,
+		    (unsigned long long) h3st.packets_sent,
+		    (unsigned long long) h3st.bytes_recv_udp,
+		    (unsigned long long) h3st.bytes_sent_udp,
+		    (unsigned long long) h3st.conn_accepted,
+		    (unsigned long long) h3st.conn_closed,
+		    (unsigned long long) h3st.handshake_completed,
+		    (unsigned long long) h3st.handshake_fail,
+		    (unsigned long long) h3st.streams_dispatched,
+		    (unsigned long long) h3st.read_pkt_err,
+		    (unsigned long long) h3st.send_fail,
+		    (unsigned long long) h3st.version_negotiation_sent,
+		    (unsigned long long) h3st.defer_appends,
+		    (unsigned long long) h3st.defer_max_depth);
+		Tcl_DStringEndSublist(drvPtr->queryPtr);
+	    }
+#endif
 	    Tcl_DStringAppendElement(drvPtr->queryPtr, "socks");
 	    sockPtr = waitPtr;
 	    Tcl_DStringStartSublist(drvPtr->queryPtr);
@@ -1394,6 +1791,9 @@ dropped:
      * TODO: Handle waiting Sock's on shutdown.
      */
 
+#if HAVE_NGHTTP3
+    NsHttp3DriverShutdown(drvPtr);
+#endif
     if (lsock != INVALID_SOCKET) {
         ns_sockclose(lsock);
     }
@@ -1581,6 +1981,10 @@ SockAccept(SOCKET lsock, Driver *drvPtr)
     SockState(sockPtr, SOCK_READWAIT);
     sockPtr->arg = NULL;
     sockPtr->connPtr = NULL;
+    sockPtr->app_protocol = NS_APP_PROTO_UNKNOWN;
+    sockPtr->http2 = NULL;
+    sockPtr->h2NeedDriverPoll = 0;
+    sockPtr->h2DeferFirst = sockPtr->h2DeferLast = NULL;
 
     /*
      * Even though the socket should have inherited
@@ -1589,6 +1993,13 @@ SockAccept(SOCKET lsock, Driver *drvPtr)
      */
 
     Ns_SockSetNonBlocking(sockPtr->sock);
+
+    {
+	int nd = 1;
+
+	(void) setsockopt(sockPtr->sock, IPPROTO_TCP, TCP_NODELAY,
+		(const void *) &nd, sizeof(nd));
+    }
 
     /*
      * Set the send/recv socket bufsizes if required.
@@ -1631,6 +2042,19 @@ SockClose(Sock *sockPtr)
 {
     Driver *drvPtr = sockPtr->drvPtr;
 
+#if HAVE_NGHTTP2
+    if (H2DriverDebugEnv()) {
+	fprintf(stderr,
+		"AOLSERVER_H2_DEBUG SockClose id=%u driver=%s state=%d "
+		"app_proto=%d http2=%p nreads=%u nwrites=%u sockfd=%d\n",
+		sockPtr->id, (drvPtr->module != NULL) ? drvPtr->module : "?",
+		sockPtr->state,
+		sockPtr->app_protocol, sockPtr->http2,
+		sockPtr->nreads, sockPtr->nwrites, (int) sockPtr->sock);
+	fflush(stderr);
+    }
+#endif
+
     /*
      * Free the Conn if the Sock is still responsible for it.
      */
@@ -1639,6 +2063,17 @@ SockClose(Sock *sockPtr)
 	NsFreeConnInterp(sockPtr->connPtr);
         FreeConn(sockPtr->connPtr);
 	sockPtr->connPtr = NULL;
+    }
+
+    NsHttp2SockCleanup(sockPtr);
+
+    if (sockPtr->sock == INVALID_SOCKET) {
+	drvPtr->stats.reads += sockPtr->nreads;
+	drvPtr->stats.writes += sockPtr->nwrites;
+	sockPtr->nextPtr = drvPtr->freeSockPtr;
+	drvPtr->freeSockPtr = sockPtr;
+	--drvPtr->nactive;
+	return;
     }
 
     (void) (*drvPtr->proc)(DriverClose, (Ns_Sock *) sockPtr, NULL, 0);
@@ -1676,6 +2111,12 @@ TriggerDriver(Driver *drvPtr)
 	Ns_Fatal("driver: trigger send() failed: %s",
 	    ns_sockstrerror(ns_sockerrno));
     }
+}
+
+void
+NsDriverTrigger(Driver *drvPtr)
+{
+    TriggerDriver(drvPtr);
 }
 
 
@@ -1801,17 +2242,96 @@ SockReadLine(Driver *drvPtr, Ns_Sock *sock, Conn *connPtr)
             max = drvPtr->maxinput;
         }
     }
+    /*
+     * Grow the buffer to at least max bytes capacity, then set the logical
+     * length back to len (bytes already consumed). Tcl_DStringSetLength only
+     * to max leaves length==max; the next SockReadLine would use
+     * iov_base=string+len with len~max and iov_len~0, so TLS never reads
+     * (h2spec generic/2/1).
+     */
     Tcl_DStringSetLength(bufPtr, max);
+    Tcl_DStringSetLength(bufPtr, len);
     buf.iov_base = bufPtr->string + len;
     buf.iov_len = max - len;
     n = (*drvPtr->proc)(DriverRecv, sock, &buf, 1);
+    if (n == NS_DRIVER_RECV_TLS_EOF) {
+	return E_CLOSE;
+    }
     if (n < 0) {
 	return E_RECV;
     } else if (n == 0) {
+	if ((drvPtr->opts & NS_DRIVER_SSL) != 0) {
+	    if (((Ns_Sock *) sock)->app_protocol == NS_APP_PROTO_H2) {
+#if HAVE_NGHTTP2
+		int tryi;
+
+		/*
+		 * No TLS app bytes yet; still queue SETTINGS so the peer
+		 * receives server data (avoids Nagle / delayed-ack stalls with
+		 * clients that wait for server frames before sending preface).
+		 */
+		NsHttp2EnsureSession((Sock *) sock);
+		(void) NsHttp2TrySend((Sock *) sock);
+		/*
+		 * The client preface often lands in the kernel (or OpenSSL)
+		 * immediately after the TLS handshake while the first read
+		 * already returned WANT_READ. One follow-up recv in this same
+		 * reader turn feeds nghttp2 so SETTINGS ACK is sent; otherwise
+		 * the peer blocks waiting for that ACK (e.g. Python h2, h2spec).
+		 */
+		for (tryi = 0; tryi < 4; tryi++) {
+		    (void) NsHttp2TrySend((Sock *) sock);
+		    n = (*drvPtr->proc)(DriverRecv, sock, &buf, 1);
+		    if (n == NS_DRIVER_RECV_TLS_EOF) {
+			return E_CLOSE;
+		    }
+		    if (n < 0) {
+			return E_RECV;
+		    }
+		    if (n > 0) {
+			((Sock *) sock)->h2NeedDriverPoll = 0;
+			len += n;
+			Tcl_DStringSetLength(bufPtr, len);
+			{
+			    ReadErr h2e = (ReadErr) NsHttp2Feed(drvPtr, (Sock *) sock,
+				    connPtr,
+				    (const unsigned char *) (bufPtr->string + (len - n)),
+				    (size_t) n);
+
+			    Tcl_DStringTrunc(bufPtr, 0);
+			    connPtr->roff = 0;
+			    return h2e;
+			}
+		    }
+		}
+		(void) NsHttp2TrySend((Sock *) sock);
+#endif
+		((Sock *) sock)->h2NeedDriverPoll = 1;
+	    }
+	    return E_NOERROR;
+	}
 	return E_CLOSE;
+    }
+    if (((Ns_Sock *) sock)->app_protocol == NS_APP_PROTO_H2) {
+	((Sock *) sock)->h2NeedDriverPoll = 0;
     }
     len += n;
     Tcl_DStringSetLength(bufPtr, len);
+
+#if HAVE_NGHTTP2
+    /*
+     * HTTP/2: feed TLS application data to nghttp2 (preface + frames).
+     */
+
+    if (((Ns_Sock *) sock)->app_protocol == NS_APP_PROTO_H2) {
+	ReadErr h2e = (ReadErr) NsHttp2Feed(drvPtr, (Sock *) sock, connPtr,
+	    (const unsigned char *) (bufPtr->string + (len - n)), (size_t) n);
+
+	Tcl_DStringTrunc(bufPtr, 0);
+	connPtr->roff = 0;
+	return h2e;
+    }
+#endif
 
     /*
      * Scan available content for lines until end-of-headers.
@@ -2047,9 +2567,15 @@ SockReadContent(Driver *drvPtr, Ns_Sock *sock, Conn *connPtr)
 	}
     }
     n = (*drvPtr->proc)(DriverRecv, sock, &buf, 1);
+    if (n == NS_DRIVER_RECV_TLS_EOF) {
+	return E_CLOSE;
+    }
     if (n < 0) {
 	return E_RECV;
     } else if (n == 0) {
+	if ((drvPtr->opts & NS_DRIVER_SSL) != 0) {
+	    return E_NOERROR;
+	}
 	return E_CLOSE;
     }
     if ((connPtr->flags & NS_CONN_FILECONTENT)
@@ -2260,6 +2786,122 @@ AllocConn(Driver *drvPtr, Ns_Time *nowPtr, Sock *sockPtr)
 /*
  *----------------------------------------------------------------------
  *
+ * NsDriverAllocConn --
+ *
+ *      Allocate a Conn (same as AllocConn) for HTTP/2 stream dispatch.
+ *
+ *----------------------------------------------------------------------
+ */
+
+Conn *
+NsDriverAllocConn(Driver *drvPtr, Ns_Time *nowPtr, Sock *sockPtr)
+{
+    return AllocConn(drvPtr, nowPtr, sockPtr);
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * NsDriverMapHostToServer --
+ *
+ *      Resolve virtual server from Host header (same logic as HTTP/1).
+ *
+ *----------------------------------------------------------------------
+ */
+
+int
+NsDriverMapHostToServer(Conn *connPtr)
+{
+    NsServer *servPtr;
+    ServerMap *mapPtr;
+    Tcl_HashEntry *hPtr;
+    char *hdr;
+
+    servPtr = connPtr->drvPtr->servPtr;
+    if (servPtr != NULL) {
+        connPtr->location = connPtr->drvPtr->location;
+    } else {
+        hdr = Ns_SetIGet(connPtr->headers, "host");
+        if (hdr == NULL) {
+            return NS_ERROR;
+        }
+        hPtr = Tcl_FindHashEntry(&hosts, hdr);
+        if (hPtr == NULL) {
+            mapPtr = defMapPtr;
+        } else {
+            mapPtr = (ServerMap *) Tcl_GetHashValue(hPtr);
+        }
+        if (mapPtr == NULL) {
+            return NS_ERROR;
+        }
+        servPtr = mapPtr->servPtr;
+        connPtr->location = mapPtr->location;
+    }
+    connPtr->servPtr = servPtr;
+    connPtr->server = servPtr->server;
+    return NS_OK;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * NsDriverH2PendingAppend --
+ *
+ *      Queue an HTTP/2 stream Conn for the driver thread (limits + NsQueueConn).
+ *
+ *----------------------------------------------------------------------
+ */
+
+void
+NsDriverH2PendingAppend(Driver *drvPtr, Conn *connPtr)
+{
+    connPtr->nextPtr = NULL;
+    Ns_MutexLock(&drvPtr->lock);
+    if (drvPtr->h2PendingLast == NULL) {
+        drvPtr->h2PendingFirst = connPtr;
+    } else {
+        drvPtr->h2PendingLast->nextPtr = connPtr;
+    }
+    drvPtr->h2PendingLast = connPtr;
+    Ns_MutexUnlock(&drvPtr->lock);
+    TriggerDriver(drvPtr);
+}
+
+#if HAVE_NGHTTP3
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * NsDriverH3PendingAppend --
+ *
+ *      Queue an HTTP/3 stream Conn for the driver thread (limits + NsQueueConn).
+ *
+ *----------------------------------------------------------------------
+ */
+
+void
+NsDriverH3PendingAppend(Driver *drvPtr, Conn *connPtr)
+{
+    connPtr->nextPtr = NULL;
+    Ns_MutexLock(&drvPtr->lock);
+    if (drvPtr->h3PendingLast == NULL) {
+	drvPtr->h3PendingFirst = connPtr;
+    } else {
+	drvPtr->h3PendingLast->nextPtr = connPtr;
+    }
+    drvPtr->h3PendingLast = connPtr;
+    Ns_MutexUnlock(&drvPtr->lock);
+    TriggerDriver(drvPtr);
+}
+
+#endif /* HAVE_NGHTTP3 */
+
+
+/*
+ *----------------------------------------------------------------------
+ *
  * FreeConn --
  *
  *	Free a Conn structure and members allocated by AllocConn.
@@ -2307,6 +2949,21 @@ FreeConn(Conn *connPtr)
     if (connPtr->authUser != NULL) {
         ns_free(connPtr->authUser);
     }
+    if ((connPtr->flags & NS_CONN_H2_BODY) && connPtr->content != NULL) {
+        ns_free(connPtr->content);
+        connPtr->content = NULL;
+    }
+#if HAVE_NGHTTP3
+    NsHttp3ConnDetach(connPtr);
+    if ((connPtr->flags & NS_CONN_H3_BODY) && connPtr->content != NULL) {
+	ns_free(connPtr->content);
+	connPtr->content = NULL;
+    }
+    if (connPtr->h3_write_buf != NULL) {
+	ns_free(connPtr->h3_write_buf);
+	connPtr->h3_write_buf = NULL;
+    }
+#endif
     Ns_SetFree(connPtr->headers);
     Ns_SetFree(connPtr->outputheaders);
 
@@ -2398,9 +3055,36 @@ ReaderThread(void *arg)
 	 * Read the connection until complete or error.
 	 */
 
-	do {
-	    SockRead(sockPtr);
-        } while (sockPtr->state == SOCK_READWAIT);
+	{
+#if HAVE_NGHTTP2
+	    unsigned int h2ReadBurst = 0;
+#endif
+	    do {
+		SockRead(sockPtr);
+#if HAVE_NGHTTP2
+		/*
+		 * After SSL WOULD_READ (DriverRecv n==0), return the socket to the
+		 * driver poll loop for POLLOUT / further reads. Use goto so the exit
+		 * is unambiguous (break inside #if can be error-prone with some cpp).
+		 */
+		if (sockPtr->state == SOCK_READWAIT
+			&& sockPtr->app_protocol == NS_APP_PROTO_H2) {
+		    if (sockPtr->h2NeedDriverPoll) {
+			goto readerDoneReadLoop;
+		    }
+		    /*
+		     * Allow a small burst of SockRead calls per driver wakeup so the
+		     * SETTINGS exchange can finish in one batch, but return to the
+		     * driver before unbounded POLLIN+SSL_read==0 spinning (PING, etc.).
+		     */
+		    if (++h2ReadBurst >= drvPtr->h2ReadBurst) {
+			goto readerDoneReadLoop;
+		    }
+		}
+#endif
+	    } while (sockPtr->state == SOCK_READWAIT);
+	}
+readerDoneReadLoop:
 
 	/*
 	 * Return the connection to the driver thread, freeing

@@ -11,7 +11,7 @@ import { Log } from "./sections/Log.jsx";
 
 export function App({ data, history }) {
   const {
-    info, jsStats, memory, server, drivers, caches, locks, threads, scheduled,
+    info, jsStats, memory, server, drivers, http2, http3, caches, locks, threads, scheduled,
     adpStats, logTail, memorySizeClasses,
   } = data || {};
   const hist = history || [];
@@ -40,7 +40,7 @@ export function App({ data, history }) {
     },
     {
       label: "Drivers",
-      content: <Drivers drivers={drivers} />,
+      content: <Drivers drivers={drivers} http2={http2} http3={http3} />,
     },
     {
       label: "ADP Cache",

@@ -8,6 +8,8 @@ option(NS_BUILD_DEPS "Download and build Tcl, OpenSSL, gperftools from source" O
 option(NS_WITH_SSL "Build nsssl module" ON)
 option(NS_WITH_ZLIB "Build nszlib module" ON)
 option(NS_WITH_V8 "Build nsjs JavaScript module (requires V8)" OFF)
+option(NS_WITH_HTTP2 "HTTP/2 over TLS (ALPN h2) via nghttp2" ON)
+option(NS_WITH_HTTP3 "HTTP/3 over QUIC (experimental)" OFF)
 
 set(CMAKE_INSTALL_PREFIX "/usr/local/aolserver" CACHE PATH "Install prefix")
 
@@ -27,6 +29,18 @@ include(CheckIncludeFile)
 
 include(cmake/CompilerWarnings.cmake)
 include(cmake/Dependencies.cmake)
+if(NS_WITH_HTTP2)
+    include(cmake/Http23Deps.cmake)
+endif()
+if(NS_WITH_HTTP3)
+    if(NOT NS_WITH_HTTP2)
+        message(FATAL_ERROR "NS_WITH_HTTP3 requires NS_WITH_HTTP2=ON")
+    endif()
+    if(NOT NS_WITH_SSL)
+        message(FATAL_ERROR "NS_WITH_HTTP3 requires NS_WITH_SSL=ON")
+    endif()
+    include(cmake/Http3Deps.cmake)
+endif()
 include(cmake/InstallLayout.cmake)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
@@ -51,6 +65,15 @@ endif()
 
 # NO_CONST: always defined (Tcl API compat)
 set(NO_CONST 1)
+
+set(HAVE_NGHTTP2 0)
+if(NS_WITH_HTTP2)
+    set(HAVE_NGHTTP2 1)
+endif()
+set(HAVE_NGHTTP3 0)
+if(NS_WITH_HTTP3)
+    set(HAVE_NGHTTP3 1)
+endif()
 
 configure_file(cmake/nsconfig.h.in ${CMAKE_BINARY_DIR}/include/nsconfig.h)
 

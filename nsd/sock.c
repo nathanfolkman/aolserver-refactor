@@ -218,6 +218,52 @@ Ns_SockListenEx(char *address, int port, int backlog)
 /*
  *----------------------------------------------------------------------
  *
+ * Ns_SockUdpListen --
+ *
+ *	Create a non-blocking UDP socket bound to address/port.
+ *
+ * Results:
+ *	A socket, or INVALID_SOCKET on error.
+ *
+ * Side effects:
+ *	Sets SO_REUSEADDR when port is non-zero.
+ *
+ *----------------------------------------------------------------------
+ */
+
+SOCKET
+Ns_SockUdpListen(char *address, int port)
+{
+    SOCKET sock;
+    struct sockaddr_in sa;
+    int n = 1;
+
+    if (Ns_GetSockAddr(&sa, address, port) != NS_OK) {
+	return INVALID_SOCKET;
+    }
+    sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock == INVALID_SOCKET) {
+	return INVALID_SOCKET;
+    }
+    sock = SockSetup(sock);
+    if (sock == INVALID_SOCKET) {
+	return INVALID_SOCKET;
+    }
+    if (sa.sin_port != 0) {
+	(void) setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *) &n,
+	    sizeof(n));
+    }
+    if (bind(sock, (struct sockaddr *) &sa, sizeof(sa)) != 0) {
+	ns_sockclose(sock);
+	return INVALID_SOCKET;
+    }
+    return sock;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
  * Ns_SockAccept --
  *
  *	Accept a TCP socket, setting close on exec.

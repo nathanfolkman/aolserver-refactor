@@ -16,6 +16,9 @@ set_target_properties(nsjs PROPERTIES
 target_compile_definitions(nsjs PRIVATE
     "NS_MODINIT=NsJs_ModInit"
 )
+if(NS_WITH_HTTP3)
+    target_compile_definitions(nsjs PRIVATE HAVE_NGHTTP3=1)
+endif()
 
 
 target_include_directories(nsjs SYSTEM PRIVATE

@@ -103,6 +103,8 @@ ExternalProject_Add(openssl_ep
     INSTALL_DIR "${DEPS_INSTALL_DIR}"
     # no-apps: only libraries are required (nsssl, nghttp2, ngtcp2). Building the
     # openssl(1) CLI can fail linking on some Linux CI images; skip it.
+    # build_libs: build only libcrypto/libssl (do not run the default target, which
+    # can still build apps on some toolchains if configure is cached incorrectly).
     CONFIGURE_COMMAND <SOURCE_DIR>/Configure
         ${OPENSSL_TARGET}
         --prefix=<INSTALL_DIR>
@@ -110,7 +112,7 @@ ExternalProject_Add(openssl_ep
         shared
         no-tests
         no-apps
-    BUILD_COMMAND make -j4
+    BUILD_COMMAND make -j4 build_libs
     INSTALL_COMMAND make install_sw
     BUILD_BYPRODUCTS "${OPENSSL_SSL_LIB}" "${OPENSSL_CRYPTO_LIB}"
 )

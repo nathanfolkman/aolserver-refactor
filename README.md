@@ -152,9 +152,7 @@ When built with **`-DNS_WITH_HTTP3=ON`**, **nsssl** can open a **UDP** listener 
 - **nsjs:** `ns.http3.stats()` / `ns.http3.stats("s1/nsssl")`; **stats-api** JSON field **`http3`**; dashboard **Drivers** tab.
 ### h3spec (QUIC)
 
-The repo vendors **`tests/h3test/bin/h3spec`** via **Git LFS** (large macOS binary). Install [Git LFS](https://git-lfs.com), run **`git lfs install`** once per user account, and after **`git clone`** run **`git lfs pull`** so the real executable is present (or use a client that fetches LFS objects on checkout).
-
-Otherwise install [h3spec](https://github.com/kazu-yamamoto/h3spec/releases), build **nsd** with **`-DNS_WITH_HTTP3=ON`**, then:
+Install [h3spec](https://github.com/kazu-yamamoto/h3spec/releases) (place the binary at **`tests/h3test/bin/h3spec`** if you want the script to find it automatically, or ensure **`h3spec`** is on your **`PATH`**). The path **`tests/h3test/bin/h3spec`** is gitignored so you can drop the binary there locally without committing it. Then build **nsd** with **`-DNS_WITH_HTTP3=ON`**, then:
 
 ```sh
 export NSD_BUILD_DIR="$PWD/build-h3"   # or your CMake build dir with HTTP/3

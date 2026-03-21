@@ -1,7 +1,7 @@
-# Regression: build AOLserver and run full TLS h2spec against tests/h2test/minimal.tcl.
-# See tests/h2test/run-h2spec.sh and README.md (HTTP/2 section).
+# Conformance: TLS h2spec, HTTP/1 Tcl+curl smoke, and (separate job) QUIC h3spec.
+# See tests/h2test/run-h2spec.sh, tests/h1test/run-http1-tests.sh, tests/h3test/run-h3spec.sh.
 
-name: h2spec
+name: conformance
 
 on:
   push:
@@ -12,17 +12,16 @@ permissions:
   contents: read
 
 jobs:
-  tls-h2spec:
+  tls-h2spec-http1:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential curl openssl libssl-dev zlib1g-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential curl openssl libssl-dev zlib1g-dev tcl
 
       - name: Configure (no nsjs/V8 — faster CI)
-        # Link against distro OpenSSL 3.x; skip building openssl_ep (avoids fragile source builds on runners).
         run: cmake -S . -B build -G Ninja -DNS_WITH_V8=OFF -DNS_USE_SYSTEM_OPENSSL=ON
 
       - name: Build
@@ -40,3 +39,39 @@ jobs:
           H2SPEC_TIMEOUT: "120"
           H2SPEC_STARTUP_SLEEP: "15"
         run: tests/h2test/run-h2spec.sh --start-nsd
+
+      - name: HTTP/1 conformance (curl + Tcl http.test)
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/build/nsd:${{ github.workspace }}/build/nsthread:${{ github.workspace }}/build/deps/install/lib
+          NS_TCL_LIBRARY: ${{ github.workspace }}/build/deps/install/lib/tcl8.6
+          HTTP1_STARTUP_SLEEP: "15"
+        run: chmod +x tests/h1test/run-http1-tests.sh && tests/h1test/run-http1-tests.sh --start-nsd
+
+  tls-h3spec:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential curl openssl libssl-dev zlib1g-dev python3
+
+      - name: Configure (HTTP/3 — bundled OpenSSL 3.5+ for QUIC)
+        run: cmake -S . -B build-h3 -G Ninja -DNS_WITH_V8=OFF -DNS_WITH_HTTP3=ON
+
+      - name: Build
+        run: cmake --build build-h3 -j"$(nproc)"
+
+      - name: Install h3spec
+        run: |
+          curl -fsSL https://github.com/kazu-yamamoto/h3spec/releases/download/v0.1.13/h3spec-linux-x86_64 -o h3spec
+          chmod +x h3spec
+          sudo install -m755 h3spec /usr/local/bin/
+
+      - name: Run h3spec
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/build-h3/nsd:${{ github.workspace }}/build-h3/nsthread:${{ github.workspace }}/build-h3/deps/install/lib
+          NS_TCL_LIBRARY: ${{ github.workspace }}/build-h3/deps/install/lib/tcl8.6
+          NSD_BUILD_DIR: ${{ github.workspace }}/build-h3
+          H3SPEC_STARTUP_EXTRA_SLEEP: "15"
+        run: tests/h3test/run-h3spec.sh --start-nsd

@@ -20,7 +20,7 @@ cmake --build build-h3 -j8
 
 ### Reproducing GitHub Actions locally (Docker, Ubuntu 24.04)
 
-The **h2spec** workflow (`.github/workflows/h2spec.yml`) matches **`docker/Dockerfile.ci`** (Ubuntu **24.04** LTS packages: CMake, Ninja, `libssl-dev`, `zlib1g-dev`, etc.). With Docker installed:
+The **conformance** workflow (`.github/workflows/h2spec.yml`) matches **`docker/Dockerfile.ci`** for the **h2spec** build (Ubuntu **24.04** LTS packages: CMake, Ninja, `libssl-dev`, `zlib1g-dev`, etc.; HTTP/3 and **`tcl`** are CI-only additions). With Docker installed:
 
 ```sh
 chmod +x docker/run-ci-build.sh
@@ -93,9 +93,15 @@ Counters are maintained **both** process-wide (sum of all drivers) and **per dri
 
 Field names: `feed_ok`, `feed_mem_recv_err`, `trysend_recoveries`, `sessions_created`, `sessions_destroyed`, `streams_dispatched`, `rst_stream_sent`, `rst_stream_recv`, `session_send_fail`, `bytes_sent`, `bytes_fed`, `ping_recv`, `ping_sent`, `ping_ack_sent`, `goaway_recv`, `goaway_sent`, `defer_appends`, `defer_max_depth`, `trysend_drain_reads`.
 
-### CI regression (h2spec)
+### CI regression (conformance workflow)
 
-On push/PR to `main` or `master`, **GitHub Actions** (`.github/workflows/h2spec.yml`) configures CMake with **`-DNS_WITH_V8=OFF -DNS_USE_SYSTEM_OPENSSL=ON`**, installs **`openssl`** (CLI for **`tests/h2test/generate-tls-certs.sh`**), **`libssl-dev`** (headers/libs for linking), **`zlib1g-dev`** (CMake **`FindZLIB`** for **nszlib**), builds **nsd** against the **distro OpenSSL 3.x**, installs the **h2spec** Linux binary, and runs **`tests/h2test/run-h2spec.sh --start-nsd`** with a 120s per-case timeout. This avoids building **`openssl_ep`** from source on CI (which can fail on some runner images). Local builds still use the bundled OpenSSL 3.5 tree by default; **`-DNS_USE_SYSTEM_OPENSSL=ON`** is optional. **HTTP/3** (`-DNS_WITH_HTTP3=ON`) still requires bundled OpenSSL 3.5+; CMake rejects **`NS_USE_SYSTEM_OPENSSL`** with HTTP/3. Adjust branches in the workflow file if your default branch differs.
+On push/PR to `main` or `master`, **GitHub Actions** (`.github/workflows/h2spec.yml`, workflow name **conformance**) runs:
+
+1. **`tls-h2spec-http1`** — CMake **`-DNS_WITH_V8=OFF -DNS_USE_SYSTEM_OPENSSL=ON`**, **`openssl`**, **`libssl-dev`**, **`zlib1g-dev`**, **`tcl`** (for **`tests/new/http.test`**), **`ninja`**, etc.; **`h2spec`** and **`tests/h2test/run-h2spec.sh --start-nsd`** (120s per-case timeout); then **`tests/h1test/run-http1-tests.sh --start-nsd`** (**`curl`** HTTP/1.1 and HTTP/1.0 smoke plus legacy **`tests/new/http.test`** against plain **nssock**). The h2 job avoids building **`openssl_ep`** on the runner.
+
+2. **`tls-h3spec`** — separate job: **`-DNS_WITH_HTTP3=ON`** (bundled OpenSSL 3.5+ for QUIC; no **`NS_USE_SYSTEM_OPENSSL`**), **`python3`** for port selection, **`h3spec`** [v0.1.13](https://github.com/kazu-yamamoto/h3spec/releases/tag/v0.1.13) **`h3spec-linux-x86_64`**, and **`tests/h3test/run-h3spec.sh --start-nsd`**.
+
+Local builds still use the bundled OpenSSL 3.5 tree by default; **`-DNS_USE_SYSTEM_OPENSSL=ON`** is optional when HTTP/3 is off. Adjust branches in the workflow file if your default branch differs.
 
 ### Debugging with AddressSanitizer / lldb
 

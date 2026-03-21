@@ -7,6 +7,8 @@
 #   ./run-h3spec.sh --start-nsd  # picks a free TCP+UDP port, exports H3SPEC_PORT, starts nsd
 #
 # Env:
+#   Linux: set LD_LIBRARY_PATH to build/nsd:build/nsthread:build/deps/install/lib (run-h3spec.sh sets
+#   defaults from NSD_BUILD_DIR when --start-nsd). macOS: DYLD_LIBRARY_PATH.
 #   H3SPEC_HOST           default 127.0.0.1
 #   H3SPEC_PORT           force port (must match running nsd if not --start-nsd)
 #   H3SPEC_PORT_BASE      first port to try when auto-picking (default 38443)
@@ -178,10 +180,21 @@ if [[ "$START_NSD" -eq 1 ]]; then
     exit 2
   fi
   "$ROOT/tests/h2test/generate-tls-certs.sh"
-  export DYLD_LIBRARY_PATH="${DYLD_LIBRARY_PATH:-$NSD_BUILD_DIR/nsd:$NSD_BUILD_DIR/nsthread:$NSD_BUILD_DIR/deps/install/lib}"
-  export NS_TCL_LIBRARY="${NS_TCL_LIBRARY:-$NSD_BUILD_DIR/deps/install/lib/tcl8.6}"
+  nsd_root="$(cd "$(dirname "$NSD_BIN")/.." && pwd)"
+  _libs="$nsd_root/nsd:$nsd_root/nsthread:$nsd_root/deps/install/lib"
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    export DYLD_LIBRARY_PATH="${DYLD_LIBRARY_PATH:-$_libs}"
+  else
+    export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-$_libs}"
+  fi
+  export NS_TCL_LIBRARY="${NS_TCL_LIBRARY:-$nsd_root/deps/install/lib/tcl8.6}"
+  export NSD_BUILD_DIR="${NSD_BUILD_DIR:-$nsd_root}"
+  nsd_args=(-f -t "$CONFIG")
+  if [[ "$(id -u)" == "0" ]]; then
+    nsd_args+=( -u nobody )
+  fi
   echo "run-h3spec: starting nsd: $NSD_BIN" >&2
-  "$NSD_BIN" -f -t "$CONFIG" &
+  ( cd "$nsd_root" && exec "$NSD_BIN" "${nsd_args[@]}" ) &
   NSD_PID=$!
   echo "run-h3spec: nsd pid=$NSD_PID" >&2
   wait_nsd_tcp || exit 2

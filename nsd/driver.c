@@ -945,14 +945,27 @@ NsSockClose(Sock *sockPtr, int keep)
 	 * stream Conns; keepalive must run the DriverKeep path, not CLOSEREQ.
 	 */
 	if (keep && sock->app_protocol == NS_APP_PROTO_H2
-		&& drvPtr->keepwait > 0
-		&& (*drvPtr->proc)(DriverKeep, sock, NULL, 0) == 0) {
+		&& drvPtr->keepwait > 0) {
+	    if ((*drvPtr->proc)(DriverKeep, sock, NULL, 0) == 0) {
+		/*
+		 * Reader will return this sock to the driver's poll list via
+		 * h2NeedDriverPoll; do not push onto readSockPtr (avoids duplicate
+		 * reader work on the same socket).
+		 */
+		SockState(sockPtr, SOCK_READWAIT);
+		TriggerDriver(drvPtr);
+		return;
+	    }
 	    /*
-	     * Reader will return this sock to the driver's poll list via
-	     * h2NeedDriverPoll; do not push onto readSockPtr (avoids duplicate
-	     * reader work on the same socket).
+	     * DriverKeep failed (e.g. TLS alert after h2spec protocol errors).
+	     * CLOSEREQ alone is never drained while the socket remains on the
+	     * poll wait list — use the same close path as the RUNNING branch.
 	     */
-	    SockState(sockPtr, SOCK_READWAIT);
+	    SockState(sockPtr, SOCK_CLOSEWAIT);
+	    Ns_MutexLock(&drvPtr->lock);
+	    sockPtr->nextPtr = drvPtr->closeSockPtr;
+	    drvPtr->closeSockPtr = sockPtr;
+	    Ns_MutexUnlock(&drvPtr->lock);
 	    TriggerDriver(drvPtr);
 	    return;
 	}
@@ -1420,7 +1433,16 @@ DriverThread(void *arg)
             case SOCK_RUNWAIT:
 		/* NB: Handled below when processing Conn queue. */
                 break;
-                    
+
+	    case SOCK_CLOSEREQ:
+	    case SOCK_ERROR:
+		/*
+		 * Orphan paths (e.g. mis-queued); normal cleanup is preqSockPtr
+		 * or NsSockClose with CLOSEWAIT. Never leave these on the poll list.
+		 */
+		SockClose(sockPtr);
+		break;
+
 	    default:
 		Ns_Fatal("impossible state");
 		break;

@@ -17,6 +17,8 @@ RUN apt-get update \
         libssl-dev \
         zlib1g-dev \
         git \
+        tcl \
+        python3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace

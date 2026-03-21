@@ -20,16 +20,17 @@ cmake --build build-h3 -j8
 
 ### Reproducing GitHub Actions locally (Docker, Ubuntu 24.04)
 
-The **conformance** workflow (`.github/workflows/h2spec.yml`) matches **`docker/Dockerfile.ci`** for the **h2spec** build (Ubuntu **24.04** LTS packages: CMake, Ninja, `libssl-dev`, `zlib1g-dev`, etc.; HTTP/3 and **`tcl`** are CI-only additions). With Docker installed:
+The **conformance** workflow (`.github/workflows/h2spec.yml`) matches **`docker/Dockerfile.ci`** (Ubuntu **24.04**: CMake, Ninja, `libssl-dev`, `zlib1g-dev`, **`tcl`**, **`python3`**, etc.). With Docker installed:
 
 ```sh
 chmod +x docker/run-ci-build.sh
 ./docker/run-ci-build.sh              # configure + build → build-docker-ci/ (gitignored)
 ./docker/run-ci-build.sh --shell       # shell in the image; repo mounted at /workspace
 ./docker/run-ci-build.sh --h2spec      # build + full h2spec (same env as CI)
+./docker/run-ci-build.sh --conformance # h2spec + HTTP/1 + HTTP/3 build + h3spec (long-running)
 ```
 
-Override **`BUILD_DIR`**, **`IMAGE`**, or **`DOCKER_PLATFORM`** if needed. **`DOCKER_PLATFORM=linux/amd64`** matches **GitHub-hosted** `ubuntu-latest` (x86_64); on Apple Silicon, omit it for a faster native **arm64** compile, or set it to reproduce CI byte-for-byte. The **`--h2spec`** path defaults to **`linux/amd64`** (the workflow installs **`h2spec_linux_amd64`**). Use **`--shell`** to run **`cmake`** / **`ninja`** by hand and capture full compiler errors.
+Override **`BUILD_DIR`**, **`IMAGE`**, or **`DOCKER_PLATFORM`** if needed. **`DOCKER_PLATFORM=linux/amd64`** matches **GitHub-hosted** `ubuntu-latest` (x86_64); on Apple Silicon, omit it for a faster native **arm64** compile, or set it to reproduce CI byte-for-byte. The **`--h2spec`** / **`--conformance`** paths default to **`linux/amd64`** (the workflow installs **`h2spec_linux_amd64`** / **`h3spec-linux-x86_64`**). The script raises undersized **`H2SPEC_TIMEOUT`** values (below **180s**) to **300s** so **`h2spec -o`** does not flake under Docker Desktop **qemu** (full **h2spec** can take **30+** minutes emulated). Use **`--shell`** to run **`cmake`** / **`ninja`** by hand and capture full compiler errors.
 
 ## Running `nsd` from the build tree (macOS)
 

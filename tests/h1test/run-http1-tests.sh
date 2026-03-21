@@ -78,7 +78,7 @@ if [[ ! "$code10" =~ ^(200|301|302|404)$ ]]; then
   exit 1
 fi
 
-# --- Tcl: tests/new/http.test (requires tclsh + tcltest, threaded Tcl) ---
+# --- Tcl: tests/new/http.test (with AOLSERVER_HTTP_TEST, http.test skips load libnsd.so) ---
 if ! command -v tclsh >/dev/null 2>&1; then
   echo "run-http1-tests: tclsh not in PATH; install Tcl (e.g. apt install tcl)" >&2
   exit 2
@@ -96,5 +96,5 @@ export AOLSERVER_HTTP_TEST="127.0.0.1:${NSSOCK_PORT}"
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-$_libs}"
 export NS_TCL_LIBRARY="${NS_TCL_LIBRARY:-$nsd_root/deps/install/lib/tcl8.6}"
 echo "run-http1-tests: tclsh tests/new/http.test (AOLSERVER_HTTP_TEST=$AOLSERVER_HTTP_TEST)" >&2
-( cd "$ROOT/tests/new" && tclsh http.test )
+( cd "$ROOT/tests/new" && exec tclsh http.test )
 exit $?

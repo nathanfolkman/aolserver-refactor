@@ -728,6 +728,19 @@ static nghttp2_session *H2SessionNew(Sock *sock)
 	return NULL;
     }
     H2ApplySockModuleOptions(opt, sock);
+    /*
+     * nghttp2 1.61 defaults that break h2spec on a single long-lived connection:
+     * - max_continuations is 8; 6.10.1 sends more CONTINUATION frames after HEADERS.
+     * - stream_reset_rate_limit (burst 1000 / rate 33/s) eventually sends GOAWAY;
+     *   7.2 expects a PING ACK after RST_STREAM with an unknown error code.
+     */
+    nghttp2_option_set_max_continuations(opt, 256);
+    /*
+     * Default burst is 1000; a full h2spec run can exceed that on one
+     * connection (GOAWAY before http2/7/2). Use a large ceiling (not
+     * UINT64_MAX: avoids surprising ratelim math in edge builds).
+     */
+    nghttp2_option_set_stream_reset_rate_limit(opt, 100000000ULL, 100000000ULL);
     rv = nghttp2_session_server_new2(&session, callbacks, sock, opt);
     nghttp2_option_del(opt);
     nghttp2_session_callbacks_del(callbacks);

@@ -31,7 +31,11 @@
 #
 
 source harness.tcl
-load libnsd.so
+# In-process AOLserver tests would load libnsd.so; against a live server (AOLSERVER_HTTP_TEST)
+# only Tcl sockets are used — skip load to allow system tclsh + distro tcltest.
+if {![info exists ::env(AOLSERVER_HTTP_TEST)]} {
+    load libnsd.so
+}
 
 package require tcltest 2.2
 namespace import -force ::tcltest::*

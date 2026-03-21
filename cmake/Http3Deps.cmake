@@ -3,6 +3,7 @@
 # Out-of-tree CMake build for ngtcp2 (autotools link probes for QUIC APIs can fail against
 # bundled OpenSSL even when SSL_set_quic_tls_cbs exists; CMake uses FindOpenSSL + compile checks).
 set(NGTCP2_EP_BINARY_DIR "${CMAKE_BINARY_DIR}/ngtcp2_ep-build")
+get_filename_component(NGTCP2_EP_BINARY_DIR "${NGTCP2_EP_BINARY_DIR}" ABSOLUTE)
 
 if(APPLE)
     set(NGHTTP3_LIB "${DEPS_INSTALL_DIR}/lib/libnghttp3.dylib")

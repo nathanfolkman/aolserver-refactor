@@ -166,6 +166,14 @@ typedef struct H2Stream {
 } H2Stream;
 
 static void H2StreamDestroy(H2Stream *s);
+
+/*
+ * Per-stream user data is only valid for stream_id > 0. Stream 0 is reserved
+ * in nghttp2 for the connection-level user_data pointer (our Sock *); treating
+ * 0 like a normal stream mis-casts Sock as H2Stream and crashes (h2spec 6.4.1).
+ */
+static H2Stream *H2GetStream(nghttp2_session *session, int32_t stream_id);
+
 static void H2ClearStreamUserData(Sock *sock, int32_t stream_id);
 static void H2FailStream(Sock *sock, int32_t stream_id, uint32_t err);
 static int DispatchH2Stream(H2Stream *s);
@@ -225,6 +233,15 @@ static void H2DeferAbort(Sock *sock)
     sock->h2DeferFirst = sock->h2DeferLast = NULL;
 }
 
+static H2Stream *
+H2GetStream(nghttp2_session *session, int32_t stream_id)
+{
+    if (stream_id <= 0) {
+	return NULL;
+    }
+    return (H2Stream *) nghttp2_session_get_stream_user_data(session, stream_id);
+}
+
 static void H2StreamDestroy(H2Stream *s)
 {
     if (s == NULL) {
@@ -280,6 +297,10 @@ static int H2OnBeginHeaders(nghttp2_session *session, const nghttp2_frame *frame
         || frame->headers.cat != NGHTTP2_HCAT_REQUEST) {
         return 0;
     }
+    if (frame->hd.stream_id <= 0) {
+	/* Stream 0 is connection scope in nghttp2; never attach H2Stream there. */
+	return 0;
+    }
     s = (H2Stream *) ns_calloc(1, sizeof(H2Stream));
     s->stream_id = frame->hd.stream_id;
     s->sock = sock;
@@ -316,7 +337,7 @@ static int H2OnHeader(nghttp2_session *session, const nghttp2_frame *frame,
 
     (void) user_data;
     (void) flags;
-    s = (H2Stream *) nghttp2_session_get_stream_user_data(session, frame->hd.stream_id);
+    s = H2GetStream(session, frame->hd.stream_id);
     if (s == NULL) {
         return 0;
     }
@@ -345,7 +366,7 @@ static int H2OnDataChunk(nghttp2_session *session, uint8_t flags, int32_t stream
     (void) session;
     (void) flags;
     (void) user_data;
-    s = (H2Stream *) nghttp2_session_get_stream_user_data(session, stream_id);
+    s = H2GetStream(session, stream_id);
     if (s == NULL) {
         return 0;
     }
@@ -501,7 +522,7 @@ static int H2OnFrameRecv(nghttp2_session *session, const nghttp2_frame *frame,
         && frame->headers.cat == NGHTTP2_HCAT_REQUEST
         && (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)
         && (frame->hd.flags & NGHTTP2_FLAG_END_HEADERS)) {
-        s = (H2Stream *) nghttp2_session_get_stream_user_data(session, frame->hd.stream_id);
+        s = H2GetStream(session, frame->hd.stream_id);
         if (s != NULL) {
 	    H2DeferAppend(sock, s);
         }
@@ -512,14 +533,13 @@ static int H2OnFrameRecv(nghttp2_session *session, const nghttp2_frame *frame,
 	/*
 	 * Trailer block (RFC 7540) ends the stream; defer like DATA+END_STREAM.
 	 */
-	s = (H2Stream *) nghttp2_session_get_stream_user_data(session,
-		frame->hd.stream_id);
+	s = H2GetStream(session, frame->hd.stream_id);
 	if (s != NULL) {
 	    H2DeferAppend(sock, s);
 	}
     } else if (frame->hd.type == NGHTTP2_DATA
                && (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
-        s = (H2Stream *) nghttp2_session_get_stream_user_data(session, frame->hd.stream_id);
+        s = H2GetStream(session, frame->hd.stream_id);
         if (s != NULL) {
 	    H2DeferAppend(sock, s);
         }
@@ -531,8 +551,7 @@ static int H2OnFrameRecv(nghttp2_session *session, const nghttp2_frame *frame,
 	 * on the last CONTINUATION (RFC 7540 6.10). Require END_HEADERS so we do not
 	 * double-defer with a prior HEADERS that already ended the block.
 	 */
-	s = (H2Stream *) nghttp2_session_get_stream_user_data(session,
-		frame->hd.stream_id);
+	s = H2GetStream(session, frame->hd.stream_id);
 	if (s != NULL) {
 	    H2DeferAppend(sock, s);
 	}
@@ -547,7 +566,14 @@ static int H2OnStreamClose(nghttp2_session *session, int32_t stream_id,
 
     (void) error_code;
     (void) user_data;
-    s = (H2Stream *) nghttp2_session_get_stream_user_data(session, stream_id);
+    if (stream_id == 0) {
+	/*
+	 * Stream 0 is connection user_data (Sock *), not an H2Stream. Never
+	 * clear or free it here.
+	 */
+	return 0;
+    }
+    s = H2GetStream(session, stream_id);
     if (s != NULL) {
         nghttp2_session_set_stream_user_data(session, stream_id, NULL);
 	/*
@@ -847,6 +873,9 @@ H2ClearStreamUserData(Sock *sock, int32_t stream_id)
 {
     nghttp2_session *sess;
 
+    if (stream_id <= 0) {
+	return;
+    }
     Ns_MutexLock(&sock->h2Lock);
     sess = (nghttp2_session *) sock->http2;
     if (sess != NULL) {
@@ -865,8 +894,10 @@ H2FailStream(Sock *sock, int32_t stream_id, uint32_t err)
     Ns_MutexLock(&sock->h2Lock);
     sess = (nghttp2_session *) sock->http2;
     if (sess != NULL) {
-	nghttp2_submit_rst_stream(sess, NGHTTP2_FLAG_NONE, stream_id, err);
-	nghttp2_session_set_stream_user_data(sess, stream_id, NULL);
+	if (stream_id > 0) {
+	    nghttp2_submit_rst_stream(sess, NGHTTP2_FLAG_NONE, stream_id, err);
+	    nghttp2_session_set_stream_user_data(sess, stream_id, NULL);
+	}
 	(void) H2SessionSendAll(sock, sess);
 	H2WakeDriverIfPending(sock, sess);
     }

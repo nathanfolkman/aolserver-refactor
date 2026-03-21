@@ -1,0 +1,20 @@
+# Toolchain aligned with .github/workflows/h2spec.yml on ubuntu-latest (24.04 LTS).
+# Build context: this directory only (see docker/run-ci-build.sh).
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        cmake \
+        ninja-build \
+        build-essential \
+        curl \
+        openssl \
+        libssl-dev \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace

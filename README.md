@@ -18,6 +18,19 @@ cmake -S . -B build-h3 -DNS_WITH_HTTP3=ON
 cmake --build build-h3 -j8
 ```
 
+### Reproducing GitHub Actions locally (Docker, Ubuntu 24.04)
+
+The **h2spec** workflow (`.github/workflows/h2spec.yml`) matches **`docker/Dockerfile.ci`** (Ubuntu **24.04** LTS packages: CMake, Ninja, `libssl-dev`, etc.). With Docker installed:
+
+```sh
+chmod +x docker/run-ci-build.sh
+./docker/run-ci-build.sh              # configure + build → build-docker-ci/ (gitignored)
+./docker/run-ci-build.sh --shell       # shell in the image; repo mounted at /workspace
+./docker/run-ci-build.sh --h2spec      # build + full h2spec (same env as CI)
+```
+
+Override **`BUILD_DIR`**, **`IMAGE`**, or **`DOCKER_PLATFORM`** if needed. **`DOCKER_PLATFORM=linux/amd64`** matches **GitHub-hosted** `ubuntu-latest` (x86_64); on Apple Silicon, omit it for a faster native **arm64** compile, or set it to reproduce CI byte-for-byte. The **`--h2spec`** path defaults to **`linux/amd64`** (the workflow installs **`h2spec_linux_amd64`**). Use **`--shell`** to run **`cmake`** / **`ninja`** by hand and capture full compiler errors.
+
 ## Running `nsd` from the build tree (macOS)
 
 The dynamic loader must find `libnsd`, `libnsthread`, and bundled Tcl/OpenSSL/nghttp2 libraries:

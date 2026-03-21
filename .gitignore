@@ -1,6 +1,7 @@
 # Local CMake build trees
 /build/
 /build-h3/
+/build-docker-ci/
 
 # Optional vendored h3spec binary (download from releases; too large for this repo)
 /tests/h3test/bin/h3spec

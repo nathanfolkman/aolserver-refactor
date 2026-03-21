@@ -1,5 +1,9 @@
 # nghttp3 + ngtcp2 (OpenSSL crypto_ossl) for HTTP/3. Requires OpenSSL 3.5+ from Dependencies.cmake.
 
+# Out-of-tree CMake build for ngtcp2 (autotools link probes for QUIC APIs can fail against
+# bundled OpenSSL even when SSL_set_quic_tls_cbs exists; CMake uses FindOpenSSL + compile checks).
+set(NGTCP2_EP_BINARY_DIR "${CMAKE_BINARY_DIR}/ngtcp2_ep-build")
+
 if(APPLE)
     set(NGHTTP3_LIB "${DEPS_INSTALL_DIR}/lib/libnghttp3.dylib")
     set(NGTCP2_LIB "${DEPS_INSTALL_DIR}/lib/libngtcp2.dylib")
@@ -36,17 +40,21 @@ ExternalProject_Add(ngtcp2_ep
     PATCH_COMMAND ${CMAKE_CURRENT_LIST_DIR}/patches/apply-ngtcp2-undersized-initial.sh
         <SOURCE_DIR> ${CMAKE_CURRENT_LIST_DIR}/patches/ngtcp2-1.21.0-allow-undersized-initial.patch
     INSTALL_DIR "${DEPS_INSTALL_DIR}"
-    BUILD_IN_SOURCE 1
-    # Many dev machines lack pkg-config; ngtcp2's OpenSSL probe then fails. Pin bundled OpenSSL.
+    BINARY_DIR "${NGTCP2_EP_BINARY_DIR}"
     CONFIGURE_COMMAND
-        ${CMAKE_COMMAND} -E env
-        "PKG_CONFIG_PATH=${DEPS_INSTALL_DIR}/lib/pkgconfig"
-        "OPENSSL_CFLAGS=-I${DEPS_INSTALL_DIR}/include"
-        "OPENSSL_LIBS=-L${DEPS_INSTALL_DIR}/lib -lssl -lcrypto"
-        <SOURCE_DIR>/configure --prefix=<INSTALL_DIR>
-        --with-openssl --enable-lib-only --enable-shared --disable-static
-    BUILD_COMMAND ${MAKE_EXECUTABLE} -j4
-    INSTALL_COMMAND ${MAKE_EXECUTABLE} install
+        ${CMAKE_COMMAND} -S <SOURCE_DIR> -B "${NGTCP2_EP_BINARY_DIR}"
+        -DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>
+        -DCMAKE_PREFIX_PATH=<INSTALL_DIR>
+        -DOPENSSL_ROOT_DIR=<INSTALL_DIR>
+        -DCMAKE_BUILD_TYPE=Release
+        -DENABLE_LIB_ONLY=ON
+        -DENABLE_STATIC_LIB=OFF
+        -DENABLE_SHARED_LIB=ON
+        -DENABLE_OPENSSL=ON
+        -DBUILD_TESTING=OFF
+        -G "${CMAKE_GENERATOR}"
+    BUILD_COMMAND ${CMAKE_COMMAND} --build "${NGTCP2_EP_BINARY_DIR}" --parallel 4
+    INSTALL_COMMAND ${CMAKE_COMMAND} --install "${NGTCP2_EP_BINARY_DIR}"
     BUILD_BYPRODUCTS "${NGTCP2_LIB}" "${NGTCP2_CRYPTO_OSSL_LIB}"
 )
 

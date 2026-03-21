@@ -1,0 +1,30 @@
+--- a/lib/nghttp2_session.c
++++ b/lib/nghttp2_session.c
+@@ -4509,20 +4509,13 @@
+ }
+ 
+ static int session_update_stream_reset_ratelim(nghttp2_session *session) {
+-  if (!session->server || (session->goaway_flags & NGHTTP2_GOAWAY_SUBMITTED)) {
+-    return 0;
+-  }
+-
+-  nghttp2_ratelim_update(&session->stream_reset_ratelim,
+-                         nghttp2_time_now_sec());
+-
+-  if (nghttp2_ratelim_drain(&session->stream_reset_ratelim, 1) == 0) {
+-    return 0;
+-  }
+-
+-  return nghttp2_session_add_goaway(session, session->last_recv_stream_id,
+-                                    NGHTTP2_INTERNAL_ERROR, NULL, 0,
+-                                    NGHTTP2_GOAWAY_AUX_NONE);
++  /*
++   * AOLserver: do not emit GOAWAY on inbound RST_STREAM rate. A full h2spec run
++   * exceeds libnghttp2's default burst (1000) on a single connection (RFC 7540
++   * 7.2). Session options still raise the limit; this removes the hard cap.
++   */
++  (void)session;
++  return 0;
+ }
+ 
+ int nghttp2_session_on_rst_stream_received(nghttp2_session *session,

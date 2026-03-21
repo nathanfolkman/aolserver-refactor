@@ -25,8 +25,8 @@ set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 set(CMAKE_MACOSX_RPATH TRUE)
 
 include(ExternalProject)
-# Autotools deps (nghttp2, nghttp3, ngtcp2) use Makefiles; do not use CMAKE_MAKE_PROGRAM,
-# which is `ninja` when the top-level generator is Ninja.
+# nghttp2/nghttp3 use autotools Makefiles; ngtcp2 uses CMake. For autotools deps do not use
+# CMAKE_MAKE_PROGRAM (it is `ninja` when the top-level generator is Ninja).
 find_program(MAKE_EXECUTABLE NAMES gmake make REQUIRED)
 include(CheckFunctionExists)
 include(CheckIncludeFile)

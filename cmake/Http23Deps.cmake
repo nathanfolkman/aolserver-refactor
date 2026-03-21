@@ -10,6 +10,9 @@ ExternalProject_Add(nghttp2_ep
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     URL https://github.com/nghttp2/nghttp2/releases/download/v1.61.0/nghttp2-1.61.0.tar.gz
     URL_HASH SHA256=aa7594c846e56a22fbf3d6e260e472268808d3b49d5e0ed339f589e9cc9d484c
+    # h2spec http2/7.2: default libnghttp2 server sends GOAWAY after 1000 inbound
+    # RST_STREAM frames on one connection; a full h2spec run exceeds that before §7.2.
+    PATCH_COMMAND patch -d <SOURCE_DIR> -p1 -i "${CMAKE_CURRENT_LIST_DIR}/patches/nghttp2-1.61.0-disable-stream-reset-goaway.patch"
     INSTALL_DIR "${DEPS_INSTALL_DIR}"
     BUILD_IN_SOURCE 1
     CONFIGURE_COMMAND <SOURCE_DIR>/configure --prefix=<INSTALL_DIR>

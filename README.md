@@ -20,7 +20,7 @@ cmake --build build-h3 -j8
 
 ### Reproducing GitHub Actions locally (Docker, Ubuntu 24.04)
 
-The **h2spec** workflow (`.github/workflows/h2spec.yml`) matches **`docker/Dockerfile.ci`** (Ubuntu **24.04** LTS packages: CMake, Ninja, `libssl-dev`, etc.). With Docker installed:
+The **h2spec** workflow (`.github/workflows/h2spec.yml`) matches **`docker/Dockerfile.ci`** (Ubuntu **24.04** LTS packages: CMake, Ninja, `libssl-dev`, `zlib1g-dev`, etc.). With Docker installed:
 
 ```sh
 chmod +x docker/run-ci-build.sh
@@ -95,7 +95,7 @@ Field names: `feed_ok`, `feed_mem_recv_err`, `trysend_recoveries`, `sessions_cre
 
 ### CI regression (h2spec)
 
-On push/PR to `main` or `master`, **GitHub Actions** (`.github/workflows/h2spec.yml`) configures CMake with **`-DNS_WITH_V8=OFF -DNS_USE_SYSTEM_OPENSSL=ON`**, installs **`openssl`** (CLI for **`tests/h2test/generate-tls-certs.sh`**) and **`libssl-dev`** (headers/libs for linking), builds **nsd** against the **distro OpenSSL 3.x**, installs the **h2spec** Linux binary, and runs **`tests/h2test/run-h2spec.sh --start-nsd`** with a 120s per-case timeout. This avoids building **`openssl_ep`** from source on CI (which can fail on some runner images). Local builds still use the bundled OpenSSL 3.5 tree by default; **`-DNS_USE_SYSTEM_OPENSSL=ON`** is optional. **HTTP/3** (`-DNS_WITH_HTTP3=ON`) still requires bundled OpenSSL 3.5+; CMake rejects **`NS_USE_SYSTEM_OPENSSL`** with HTTP/3. Adjust branches in the workflow file if your default branch differs.
+On push/PR to `main` or `master`, **GitHub Actions** (`.github/workflows/h2spec.yml`) configures CMake with **`-DNS_WITH_V8=OFF -DNS_USE_SYSTEM_OPENSSL=ON`**, installs **`openssl`** (CLI for **`tests/h2test/generate-tls-certs.sh`**), **`libssl-dev`** (headers/libs for linking), **`zlib1g-dev`** (CMake **`FindZLIB`** for **nszlib**), builds **nsd** against the **distro OpenSSL 3.x**, installs the **h2spec** Linux binary, and runs **`tests/h2test/run-h2spec.sh --start-nsd`** with a 120s per-case timeout. This avoids building **`openssl_ep`** from source on CI (which can fail on some runner images). Local builds still use the bundled OpenSSL 3.5 tree by default; **`-DNS_USE_SYSTEM_OPENSSL=ON`** is optional. **HTTP/3** (`-DNS_WITH_HTTP3=ON`) still requires bundled OpenSSL 3.5+; CMake rejects **`NS_USE_SYSTEM_OPENSSL`** with HTTP/3. Adjust branches in the workflow file if your default branch differs.
 
 ### Debugging with AddressSanitizer / lldb
 

@@ -4,8 +4,9 @@
 # Usage:
 #   ./run-h2spec.sh              # expects nsd already listening on 127.0.0.1:8443
 #   ./run-h2spec.sh --start-nsd  # starts build/nsd in background, runs h2spec, stops nsd
-# Env (macOS from repo root):
-#   export DYLD_LIBRARY_PATH="$PWD/build/nsd:$PWD/build/nsthread:$PWD/build/deps/install/lib"
+# Env when nsd is already running (from repo root; use your build dir instead of build/ if needed):
+#   macOS: export DYLD_LIBRARY_PATH="$PWD/build/nsd:$PWD/build/nsthread:$PWD/build/deps/install/lib"
+#   Linux: export LD_LIBRARY_PATH="$PWD/build/nsd:$PWD/build/nsthread:$PWD/build/deps/install/lib"
 #   export NS_TCL_LIBRARY="$PWD/build/deps/install/lib/tcl8.6"
 #
 # Optional: H2SPEC_ARGS="generic/2/1" to run a single case; JUNIT=path for -j report.
@@ -56,9 +57,23 @@ if [[ "$START_NSD" -eq 1 ]]; then
     exit 2
   fi
   "$ROOT/tests/h2test/generate-tls-certs.sh"
-  export DYLD_LIBRARY_PATH="${DYLD_LIBRARY_PATH:-$ROOT/build/nsd:$ROOT/build/nsthread:$ROOT/build/deps/install/lib}"
-  export NS_TCL_LIBRARY="${NS_TCL_LIBRARY:-$ROOT/build/deps/install/lib/tcl8.6}"
-  "$NSD_BIN" -f -t "$CONFIG" &
+  nsd_root="$(cd "$(dirname "$NSD_BIN")/.." && pwd)"
+  _libs="$nsd_root/nsd:$nsd_root/nsthread:$nsd_root/deps/install/lib"
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    export DYLD_LIBRARY_PATH="${DYLD_LIBRARY_PATH:-$_libs}"
+  else
+    export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-$_libs}"
+  fi
+  export NS_TCL_LIBRARY="${NS_TCL_LIBRARY:-$nsd_root/deps/install/lib/tcl8.6}"
+  export NSD_BUILD_DIR="${NSD_BUILD_DIR:-$nsd_root}"
+  # Linux: CMake links Tcl with a build-relative DT_NEEDED (deps/install/lib/...); run nsd with
+  # cwd at the CMake binary dir so the dynamic loader resolves that path.
+  # Docker (and any root shell): nsd refuses to run as uid 0 without -u (GitHub Actions is non-root).
+  nsd_args=(-f -t "$CONFIG")
+  if [[ "$(id -u)" == "0" ]]; then
+    nsd_args+=( -u nobody )
+  fi
+  ( cd "$nsd_root" && exec "$NSD_BIN" "${nsd_args[@]}" ) &
   NSD_PID=$!
   echo "run-h2spec: nsd pid=$NSD_PID, waiting ${H2SPEC_STARTUP_SLEEP:-12}s for readers..."
   sleep "${H2SPEC_STARTUP_SLEEP:-12}"

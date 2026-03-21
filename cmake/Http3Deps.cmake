@@ -21,8 +21,8 @@ ExternalProject_Add(nghttp3_ep
         env PKG_CONFIG_PATH=<INSTALL_DIR>/lib/pkgconfig
         <SOURCE_DIR>/configure --prefix=<INSTALL_DIR>
         --enable-lib-only --enable-shared --disable-static
-    BUILD_COMMAND ${CMAKE_MAKE_PROGRAM} -C lib -j4
-    INSTALL_COMMAND ${CMAKE_MAKE_PROGRAM} -C lib install
+    BUILD_COMMAND ${MAKE_EXECUTABLE} -C lib -j4
+    INSTALL_COMMAND ${MAKE_EXECUTABLE} -C lib install
     BUILD_BYPRODUCTS "${NGHTTP3_LIB}"
 )
 
@@ -45,8 +45,8 @@ ExternalProject_Add(ngtcp2_ep
         "OPENSSL_LIBS=-L${DEPS_INSTALL_DIR}/lib -lssl -lcrypto"
         <SOURCE_DIR>/configure --prefix=<INSTALL_DIR>
         --with-openssl --enable-lib-only --enable-shared --disable-static
-    BUILD_COMMAND ${CMAKE_MAKE_PROGRAM} -j4
-    INSTALL_COMMAND ${CMAKE_MAKE_PROGRAM} install
+    BUILD_COMMAND ${MAKE_EXECUTABLE} -j4
+    INSTALL_COMMAND ${MAKE_EXECUTABLE} install
     BUILD_BYPRODUCTS "${NGTCP2_LIB}" "${NGTCP2_CRYPTO_OSSL_LIB}"
 )
 

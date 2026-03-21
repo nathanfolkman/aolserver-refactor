@@ -14,8 +14,8 @@ ExternalProject_Add(nghttp2_ep
     BUILD_IN_SOURCE 1
     CONFIGURE_COMMAND <SOURCE_DIR>/configure --prefix=<INSTALL_DIR>
         --enable-lib-only --disable-static --enable-shared
-    BUILD_COMMAND ${CMAKE_MAKE_PROGRAM} -C lib -j4
-    INSTALL_COMMAND ${CMAKE_MAKE_PROGRAM} -C lib install
+    BUILD_COMMAND ${MAKE_EXECUTABLE} -C lib -j4
+    INSTALL_COMMAND ${MAKE_EXECUTABLE} -C lib install
     BUILD_BYPRODUCTS "${NGHTTP2_LIB}"
 )
 

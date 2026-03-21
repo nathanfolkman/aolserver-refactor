@@ -1,7 +1,8 @@
-# Toolchain aligned with .github/workflows/h2spec.yml on ubuntu-latest (24.04 LTS).
+# Toolchain aligned with .github/workflows/h2spec.yml on ubuntu-24.04 (24.04 LTS).
 # Build context: this directory only (see docker/run-ci-build.sh).
+# Digest pins the image layer; bump when intentionally refreshing the base OS.
+FROM ubuntu:24.04@sha256:67efaecc0031a612cf7bb3c863407018dbbef0a971f62032b77aa542ac8ac0d2
 
-FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -14,6 +15,7 @@ RUN apt-get update \
         curl \
         openssl \
         libssl-dev \
+        zlib1g-dev \
         git \
     && rm -rf /var/lib/apt/lists/*
 

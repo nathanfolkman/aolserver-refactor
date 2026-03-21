@@ -156,6 +156,7 @@ typedef struct H2Stream {
     Ns_Set *hdrs;
     Ns_DString body;
     int dispatched;
+    int defer_pend; /* Set while stream is on sock's h2 defer queue (at most once). */
 } H2Stream;
 
 static void H2StreamDestroy(H2Stream *s);
@@ -171,10 +172,15 @@ typedef struct H2Defer {
 
 static void H2DeferAppend(Sock *sock, H2Stream *s)
 {
-    H2Defer *d = (H2Defer *) ns_malloc(sizeof(H2Defer));
+    H2Defer *d;
     H2Defer *p;
     unsigned long long depth = 0u;
 
+    if (s->defer_pend != 0) {
+	return;
+    }
+    s->defer_pend = 1;
+    d = (H2Defer *) ns_malloc(sizeof(H2Defer));
     d->s = s;
     d->next = NULL;
     if (sock->h2DeferLast == NULL) {
@@ -483,14 +489,16 @@ static int H2OnFrameRecv(nghttp2_session *session, const nghttp2_frame *frame,
 
     if (frame->hd.type == NGHTTP2_HEADERS
         && frame->headers.cat == NGHTTP2_HCAT_REQUEST
-        && (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
+        && (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)
+        && (frame->hd.flags & NGHTTP2_FLAG_END_HEADERS)) {
         s = (H2Stream *) nghttp2_session_get_stream_user_data(session, frame->hd.stream_id);
         if (s != NULL) {
 	    H2DeferAppend(sock, s);
         }
     } else if (frame->hd.type == NGHTTP2_HEADERS
 	    && frame->headers.cat == NGHTTP2_HCAT_HEADERS
-	    && (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
+	    && (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)
+	    && (frame->hd.flags & NGHTTP2_FLAG_END_HEADERS)) {
 	/*
 	 * Trailer block (RFC 7540) ends the stream; defer like DATA+END_STREAM.
 	 */
@@ -505,6 +513,19 @@ static int H2OnFrameRecv(nghttp2_session *session, const nghttp2_frame *frame,
         if (s != NULL) {
 	    H2DeferAppend(sock, s);
         }
+    } else if (frame->hd.type == NGHTTP2_CONTINUATION
+               && (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)
+               && (frame->hd.flags & NGHTTP2_FLAG_END_HEADERS)) {
+	/*
+	 * Header blocks split across HEADERS + CONTINUATION may carry END_STREAM only
+	 * on the last CONTINUATION (RFC 7540 6.10). Require END_HEADERS so we do not
+	 * double-defer with a prior HEADERS that already ended the block.
+	 */
+	s = (H2Stream *) nghttp2_session_get_stream_user_data(session,
+		frame->hd.stream_id);
+	if (s != NULL) {
+	    H2DeferAppend(sock, s);
+	}
     }
     return 0;
 }
@@ -787,6 +808,7 @@ H2DispatchDeferred(Sock *sockPtr)
     while (dq != NULL) {
 	H2Defer *next = dq->next;
 
+	dq->s->defer_pend = 0;
 	(void) DispatchH2Stream(dq->s);
 	ns_free(dq);
 	dq = next;

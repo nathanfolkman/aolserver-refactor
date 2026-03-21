@@ -157,6 +157,12 @@ typedef struct H2Stream {
     Ns_DString body;
     int dispatched;
     int defer_pend; /* Set while stream is on sock's h2 defer queue (at most once). */
+    /*
+     * nghttp2 may call on_stream_close while the stream is still in the defer
+     * queue (e.g. RST_STREAM / protocol errors during h2spec). Do not free in
+     * the close callback in that case; DispatchH2Stream drops the work.
+     */
+    int closed_before_dispatch;
 } H2Stream;
 
 static void H2StreamDestroy(H2Stream *s);
@@ -357,6 +363,10 @@ static int DispatchH2Stream(H2Stream *s)
     char *clHeader;
     int contentLen = 0;
 
+    if (s->closed_before_dispatch) {
+	H2StreamDestroy(s);
+	return 0;
+    }
     if (s->dispatched || s->method == NULL || s->path == NULL) {
         return 0;
     }
@@ -540,6 +550,14 @@ static int H2OnStreamClose(nghttp2_session *session, int32_t stream_id,
     s = (H2Stream *) nghttp2_session_get_stream_user_data(session, stream_id);
     if (s != NULL) {
         nghttp2_session_set_stream_user_data(session, stream_id, NULL);
+	/*
+	 * H2DeferAppend may still hold a pointer to this stream. Freeing here
+	 * races H2DispatchDeferred and crashes (signal 11) under h2spec.
+	 */
+	if (s->defer_pend) {
+	    s->closed_before_dispatch = 1;
+	    return 0;
+	}
         H2StreamDestroy(s);
     }
     return 0;

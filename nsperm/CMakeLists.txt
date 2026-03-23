@@ -5,7 +5,7 @@ add_library(nsperm MODULE
 target_compile_definitions(nsperm PRIVATE NS_MODINIT=NsPerm_ModInit)
 target_include_directories(nsperm
     SYSTEM PRIVATE
-        ${CMAKE_BINARY_DIR}/deps/install/include
+        ${DEPS_INSTALL_DIR}/include
 )
 target_link_libraries(nsperm PRIVATE nsd)
 set_target_properties(nsperm PROPERTIES PREFIX "" SUFFIX ".so")

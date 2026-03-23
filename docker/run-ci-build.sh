@@ -78,8 +78,8 @@ case "${MODE:-}" in
     docker run --rm "${PLATFORM_ARGS[@]}" \
       -v "$ROOT:/workspace" \
       -w /workspace \
-      -e LD_LIBRARY_PATH="/workspace/$BUILD_DIR/nsd:/workspace/$BUILD_DIR/nsthread:/workspace/$BUILD_DIR/deps/install/lib" \
-      -e NS_TCL_LIBRARY="/workspace/$BUILD_DIR/deps/install/lib/tcl8.6" \
+      -e LD_LIBRARY_PATH="/workspace/$BUILD_DIR/nsd:/workspace/$BUILD_DIR/nsthread:/workspace/deps-install/lib" \
+      -e NS_TCL_LIBRARY="/workspace/deps-install/lib/tcl8.6" \
       -e H2SPEC_TIMEOUT="$(h2spec_docker_timeout)" \
       -e H2SPEC_STARTUP_SLEEP="${H2SPEC_STARTUP_SLEEP:-15}" \
       -e BUILD_DIR="$BUILD_DIR" \
@@ -97,8 +97,8 @@ case "${MODE:-}" in
     docker run --rm "${PLATFORM_ARGS[@]}" \
       -v "$ROOT:/workspace" \
       -w /workspace \
-      -e LD_LIBRARY_PATH="/workspace/$BUILD_DIR/nsd:/workspace/$BUILD_DIR/nsthread:/workspace/$BUILD_DIR/deps/install/lib" \
-      -e NS_TCL_LIBRARY="/workspace/$BUILD_DIR/deps/install/lib/tcl8.6" \
+      -e LD_LIBRARY_PATH="/workspace/$BUILD_DIR/nsd:/workspace/$BUILD_DIR/nsthread:/workspace/deps-install/lib" \
+      -e NS_TCL_LIBRARY="/workspace/deps-install/lib/tcl8.6" \
       -e H2SPEC_TIMEOUT="$(h2spec_docker_timeout)" \
       -e H2SPEC_STARTUP_SLEEP="${H2SPEC_STARTUP_SLEEP:-15}" \
       -e HTTP1_STARTUP_SLEEP="${HTTP1_STARTUP_SLEEP:-15}" \
@@ -128,8 +128,8 @@ case "${MODE:-}" in
     docker run --rm "${PLATFORM_ARGS[@]}" \
       -v "$ROOT:/workspace" \
       -w /workspace \
-      -e LD_LIBRARY_PATH="/workspace/$BUILD_DIR_H3/nsd:/workspace/$BUILD_DIR_H3/nsthread:/workspace/$BUILD_DIR_H3/deps/install/lib" \
-      -e NS_TCL_LIBRARY="/workspace/$BUILD_DIR_H3/deps/install/lib/tcl8.6" \
+      -e LD_LIBRARY_PATH="/workspace/$BUILD_DIR_H3/nsd:/workspace/$BUILD_DIR_H3/nsthread:/workspace/deps-install/lib" \
+      -e NS_TCL_LIBRARY="/workspace/deps-install/lib/tcl8.6" \
       -e NSD_BUILD_DIR="/workspace/$BUILD_DIR_H3" \
       -e H3SPEC_STARTUP_EXTRA_SLEEP="${H3SPEC_STARTUP_EXTRA_SLEEP:-15}" \
       "$IMAGE" \

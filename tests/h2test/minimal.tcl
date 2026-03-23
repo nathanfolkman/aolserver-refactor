@@ -1,7 +1,7 @@
 # Minimal AOLserver config for HTTP/2 TLS testing.
 # Run from repo root:
-#   DYLD_LIBRARY_PATH=build/nsd:build/nsthread:build/deps/install/lib \
-#   NS_TCL_LIBRARY=build/deps/install/lib/tcl8.6 \
+#   DYLD_LIBRARY_PATH=build/nsd:build/nsthread:deps-install/lib \
+#   NS_TCL_LIBRARY=deps-install/lib/tcl8.6 \
 #   build/nsd/nsd -ft tests/h2test/minimal.tcl
 # Optional: NSD_BUILD_DIR (e.g. build-h3) so modules match the nsd binary; NSSOCK_PORT
 # when 127.0.0.1:8080 is already in use; H2SPEC_TLS_PORT for nsssl (default 8443).

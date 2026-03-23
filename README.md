@@ -38,8 +38,8 @@ The dynamic loader must find `libnsd`, `libnsthread`, and bundled Tcl/OpenSSL/ng
 
 ```sh
 tests/h2test/generate-tls-certs.sh   # self-signed cert.pem + key.pem (gitignored; OpenSSL CLI)
-export DYLD_LIBRARY_PATH="$PWD/build/nsd:$PWD/build/nsthread:$PWD/build/deps/install/lib"
-export NS_TCL_LIBRARY="$PWD/build/deps/install/lib/tcl8.6"
+export DYLD_LIBRARY_PATH="$PWD/build/nsd:$PWD/build/nsthread:$PWD/deps-install/lib"
+export NS_TCL_LIBRARY="$PWD/deps-install/lib/tcl8.6"
 ./build/nsd/nsd -f -t tests/h2test/minimal.tcl
 ```
 
@@ -179,8 +179,8 @@ Install [h3spec](https://github.com/kazu-yamamoto/h3spec/releases) (place the bi
 
 ```sh
 export NSD_BUILD_DIR="$PWD/build-h3"   # or your CMake build dir with HTTP/3
-export DYLD_LIBRARY_PATH="$NSD_BUILD_DIR/nsd:$NSD_BUILD_DIR/nsthread:$NSD_BUILD_DIR/deps/install/lib"
-export NS_TCL_LIBRARY="$NSD_BUILD_DIR/deps/install/lib/tcl8.6"
+export DYLD_LIBRARY_PATH="$NSD_BUILD_DIR/nsd:$NSD_BUILD_DIR/nsthread:$PWD/deps-install/lib"
+export NS_TCL_LIBRARY="$PWD/deps-install/lib/tcl8.6"
 ./tests/h3test/run-h3spec.sh --start-nsd
 ```
 

@@ -8,7 +8,7 @@ add_library(nsthread SHARED ${NSTHREAD_SRCS})
 target_compile_definitions(nsthread PRIVATE "NSTHREAD_EXPORTS=")
 target_include_directories(nsthread
     SYSTEM PRIVATE
-        ${CMAKE_BINARY_DIR}/deps/install/include
+        ${DEPS_INSTALL_DIR}/include
 )
 target_link_libraries(nsthread
     PUBLIC Tcl::Tcl

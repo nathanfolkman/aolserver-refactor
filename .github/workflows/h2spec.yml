@@ -34,16 +34,16 @@ jobs:
 
       - name: Run h2spec
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/build/nsd:${{ github.workspace }}/build/nsthread:${{ github.workspace }}/build/deps/install/lib
-          NS_TCL_LIBRARY: ${{ github.workspace }}/build/deps/install/lib/tcl8.6
+          LD_LIBRARY_PATH: ${{ github.workspace }}/build/nsd:${{ github.workspace }}/build/nsthread:${{ github.workspace }}/deps-install/lib
+          NS_TCL_LIBRARY: ${{ github.workspace }}/deps-install/lib/tcl8.6
           H2SPEC_TIMEOUT: "120"
           H2SPEC_STARTUP_SLEEP: "15"
         run: tests/h2test/run-h2spec.sh --start-nsd
 
       - name: HTTP/1 conformance (curl + Tcl http.test)
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/build/nsd:${{ github.workspace }}/build/nsthread:${{ github.workspace }}/build/deps/install/lib
-          NS_TCL_LIBRARY: ${{ github.workspace }}/build/deps/install/lib/tcl8.6
+          LD_LIBRARY_PATH: ${{ github.workspace }}/build/nsd:${{ github.workspace }}/build/nsthread:${{ github.workspace }}/deps-install/lib
+          NS_TCL_LIBRARY: ${{ github.workspace }}/deps-install/lib/tcl8.6
           HTTP1_STARTUP_SLEEP: "15"
         run: chmod +x tests/h1test/run-http1-tests.sh && tests/h1test/run-http1-tests.sh --start-nsd
 
@@ -70,8 +70,8 @@ jobs:
 
       - name: Run h3spec
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/build-h3/nsd:${{ github.workspace }}/build-h3/nsthread:${{ github.workspace }}/build-h3/deps/install/lib
-          NS_TCL_LIBRARY: ${{ github.workspace }}/build-h3/deps/install/lib/tcl8.6
+          LD_LIBRARY_PATH: ${{ github.workspace }}/build-h3/nsd:${{ github.workspace }}/build-h3/nsthread:${{ github.workspace }}/deps-install/lib
+          NS_TCL_LIBRARY: ${{ github.workspace }}/deps-install/lib/tcl8.6
           NSD_BUILD_DIR: ${{ github.workspace }}/build-h3
           H3SPEC_STARTUP_EXTRA_SLEEP: "15"
         run: tests/h3test/run-h3spec.sh --start-nsd

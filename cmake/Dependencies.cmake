@@ -1,7 +1,8 @@
-set(DEPS_INSTALL_DIR "${CMAKE_BINARY_DIR}/deps/install")
-# Ninja link steps run from per-target dirs (e.g. build/nsd); relative paths like
-# deps/install/lib/libssl.so would resolve incorrectly. Always use absolute paths.
-get_filename_component(DEPS_INSTALL_DIR "${DEPS_INSTALL_DIR}" ABSOLUTE)
+# Keep bundled deps outside CMAKE_BINARY_DIR (e.g. <repo>/deps-install) so the Ninja
+# generator does not shorten IMPORTED library paths to build-relative deps/install/...;
+# the linker often runs from build/nsd/ (etc.) and those paths then fail to resolve.
+get_filename_component(DEPS_INSTALL_DIR "${CMAKE_BINARY_DIR}/../deps-install" ABSOLUTE
+    BASE_DIR "${CMAKE_SOURCE_DIR}")
 
 # Create the include dir now so CMake's configure-time validation of
 # INTERFACE_INCLUDE_DIRECTORIES on IMPORTED targets doesn't fail.

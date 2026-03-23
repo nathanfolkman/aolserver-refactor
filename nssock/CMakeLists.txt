@@ -5,7 +5,7 @@ add_library(nssock MODULE
 target_compile_definitions(nssock PRIVATE NS_MODINIT=NsSock_ModInit)
 target_include_directories(nssock
     SYSTEM PRIVATE
-        ${CMAKE_BINARY_DIR}/deps/install/include
+        ${DEPS_INSTALL_DIR}/include
 )
 target_link_libraries(nssock PRIVATE nsd)
 set_target_properties(nssock PROPERTIES PREFIX "" SUFFIX ".so")

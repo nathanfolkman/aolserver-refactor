@@ -5,7 +5,7 @@ add_library(nslog MODULE
 target_compile_definitions(nslog PRIVATE NS_MODINIT=NsLog_ModInit)
 target_include_directories(nslog
     SYSTEM PRIVATE
-        ${CMAKE_BINARY_DIR}/deps/install/include
+        ${DEPS_INSTALL_DIR}/include
 )
 target_link_libraries(nslog PRIVATE nsd)
 set_target_properties(nslog PROPERTIES PREFIX "" SUFFIX ".so")

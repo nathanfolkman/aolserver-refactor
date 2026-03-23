@@ -2,8 +2,8 @@
 # Reuses certificate material from tests/h2test.
 # Build with: cmake .. -DNS_WITH_HTTP3=ON
 # Run:
-#   DYLD_LIBRARY_PATH=build/nsd:build/nsthread:build/deps/install/lib \
-#   NS_TCL_LIBRARY=build/deps/install/lib/tcl8.6 \
+#   DYLD_LIBRARY_PATH=build/nsd:build/nsthread:deps-install/lib \
+#   NS_TCL_LIBRARY=deps-install/lib/tcl8.6 \
 #   build/nsd/nsd -ft tests/h3test/minimal.tcl
 # Optional: export H3SPEC_PORT=38443 (1024–65535) so nsssl TLS + QUIC use that port
 # (run-h3spec.sh --start-nsd sets it automatically).

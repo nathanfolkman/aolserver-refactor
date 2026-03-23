@@ -9,7 +9,7 @@ add_library(nsdb MODULE
 target_compile_definitions(nsdb PRIVATE NS_MODINIT=NsDb_ModInit)
 target_include_directories(nsdb
     SYSTEM PRIVATE
-        ${CMAKE_BINARY_DIR}/deps/install/include
+        ${DEPS_INSTALL_DIR}/include
 )
 target_link_libraries(nsdb PRIVATE nsd)
 set_target_properties(nsdb PROPERTIES PREFIX "" SUFFIX ".so")

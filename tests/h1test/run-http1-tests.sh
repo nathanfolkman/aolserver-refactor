@@ -41,13 +41,15 @@ fi
 
 "$ROOT/tests/h2test/generate-tls-certs.sh"
 nsd_root="$(cd "$(dirname "$NSD_BIN")/.." && pwd)"
-_libs="$nsd_root/nsd:$nsd_root/nsthread:$nsd_root/deps/install/lib"
+repo_root="$(cd "$nsd_root/.." && pwd)"
+_deps_lib="$repo_root/deps-install/lib"
+_libs="$nsd_root/nsd:$nsd_root/nsthread:$_deps_lib"
 if [[ "$(uname -s)" == "Darwin" ]]; then
   export DYLD_LIBRARY_PATH="${DYLD_LIBRARY_PATH:-$_libs}"
 else
   export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-$_libs}"
 fi
-export NS_TCL_LIBRARY="${NS_TCL_LIBRARY:-$nsd_root/deps/install/lib/tcl8.6}"
+export NS_TCL_LIBRARY="${NS_TCL_LIBRARY:-$_deps_lib/tcl8.6}"
 export NSD_BUILD_DIR="${NSD_BUILD_DIR:-$nsd_root}"
 export NSSOCK_PORT
 
@@ -94,7 +96,7 @@ fi
 
 export AOLSERVER_HTTP_TEST="127.0.0.1:${NSSOCK_PORT}"
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-$_libs}"
-export NS_TCL_LIBRARY="${NS_TCL_LIBRARY:-$nsd_root/deps/install/lib/tcl8.6}"
+export NS_TCL_LIBRARY="${NS_TCL_LIBRARY:-$_deps_lib/tcl8.6}"
 echo "run-http1-tests: tclsh tests/new/http.test (AOLSERVER_HTTP_TEST=$AOLSERVER_HTTP_TEST)" >&2
 ( cd "$ROOT/tests/new" && exec tclsh http.test )
 exit $?

@@ -127,8 +127,8 @@ if [[ "$MODE" == h2 ]]; then
   fi
   NSD_BIN="${NSD_BIN:-$NSD_BUILD_DIR/nsd/nsd}"
   export NSD_BUILD_DIR
-  export DYLD_LIBRARY_PATH="${DYLD_LIBRARY_PATH:-$NSD_BUILD_DIR/nsd:$NSD_BUILD_DIR/nsthread:$NSD_BUILD_DIR/deps/install/lib}"
-  export NS_TCL_LIBRARY="${NS_TCL_LIBRARY:-$NSD_BUILD_DIR/deps/install/lib/tcl8.6}"
+  export DYLD_LIBRARY_PATH="${DYLD_LIBRARY_PATH:-$NSD_BUILD_DIR/nsd:$NSD_BUILD_DIR/nsthread:$ROOT/deps-install/lib}"
+  export NS_TCL_LIBRARY="${NS_TCL_LIBRARY:-$ROOT/deps-install/lib/tcl8.6}"
   # Optional: override TLS port in config via env (tests/h2test/minimal.tcl must support H2SPEC_TLS_PORT)
   export H2SPEC_TLS_PORT="$H2_TLS_PORT"
 else
@@ -142,8 +142,8 @@ else
   fi
   NSD_BIN="${NSD_BIN:-$NSD_BUILD_DIR/nsd/nsd}"
   export NSD_BUILD_DIR
-  export DYLD_LIBRARY_PATH="${DYLD_LIBRARY_PATH:-$NSD_BUILD_DIR/nsd:$NSD_BUILD_DIR/nsthread:$NSD_BUILD_DIR/deps/install/lib}"
-  export NS_TCL_LIBRARY="${NS_TCL_LIBRARY:-$NSD_BUILD_DIR/deps/install/lib/tcl8.6}"
+  export DYLD_LIBRARY_PATH="${DYLD_LIBRARY_PATH:-$NSD_BUILD_DIR/nsd:$NSD_BUILD_DIR/nsthread:$ROOT/deps-install/lib}"
+  export NS_TCL_LIBRARY="${NS_TCL_LIBRARY:-$ROOT/deps-install/lib/tcl8.6}"
   # Ignore inherited H3SPEC_PORT from the shell (e.g. after run-h3spec.sh) unless
   # NSD_SHUTDOWN_H3_PORT is set for this invocation.
   if [[ -n "${NSD_SHUTDOWN_H3_PORT:-}" ]]; then

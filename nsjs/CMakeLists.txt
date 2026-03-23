@@ -22,7 +22,7 @@ endif()
 
 
 target_include_directories(nsjs SYSTEM PRIVATE
-    ${CMAKE_BINARY_DIR}/deps/install/include
+    ${DEPS_INSTALL_DIR}/include
 )
 
 target_link_libraries(nsjs PRIVATE nsd V8::V8 Tcmalloc::Tcmalloc)

@@ -21,7 +21,7 @@ add_library(nsd SHARED ${NSD_SRCS})
 target_compile_definitions(nsd PRIVATE "NSD_EXPORTS=")
 target_include_directories(nsd
     SYSTEM PRIVATE
-        ${CMAKE_BINARY_DIR}/deps/install/include
+        ${DEPS_INSTALL_DIR}/include
 )
 target_link_libraries(nsd
     PUBLIC nsthread Tcl::Tcl

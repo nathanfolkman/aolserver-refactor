@@ -5,7 +5,7 @@ add_library(nscp MODULE
 target_compile_definitions(nscp PRIVATE NS_MODINIT=NsCp_ModInit)
 target_include_directories(nscp
     SYSTEM PRIVATE
-        ${CMAKE_BINARY_DIR}/deps/install/include
+        ${DEPS_INSTALL_DIR}/include
 )
 target_link_libraries(nscp PRIVATE nsd)
 set_target_properties(nscp PROPERTIES PREFIX "" SUFFIX ".so")

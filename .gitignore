@@ -1,3 +1,6 @@
+# Bundled ExternalProject install prefix (sibling of build dir, not under build/)
+/deps-install/
+
 # Local CMake build trees
 /build/
 /build-h3/

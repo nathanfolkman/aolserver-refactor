@@ -5,7 +5,7 @@ add_library(nscgi MODULE
 target_compile_definitions(nscgi PRIVATE NS_MODINIT=NsCgi_ModInit)
 target_include_directories(nscgi
     SYSTEM PRIVATE
-        ${CMAKE_BINARY_DIR}/deps/install/include
+        ${DEPS_INSTALL_DIR}/include
 )
 target_link_libraries(nscgi PRIVATE nsd)
 set_target_properties(nscgi PROPERTIES PREFIX "" SUFFIX ".so")

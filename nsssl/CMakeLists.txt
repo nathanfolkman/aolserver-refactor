@@ -5,7 +5,7 @@ add_library(nsssl MODULE
 target_compile_definitions(nsssl PRIVATE NS_MODINIT=NsSSL_ModInit)
 target_include_directories(nsssl
     SYSTEM PRIVATE
-        ${CMAKE_BINARY_DIR}/deps/install/include
+        ${DEPS_INSTALL_DIR}/include
 )
 target_link_libraries(nsssl PRIVATE nsd OpenSSL::SSL OpenSSL::Crypto)
 set_target_properties(nsssl PROPERTIES PREFIX "" SUFFIX ".so")

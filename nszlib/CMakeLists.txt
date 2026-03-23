@@ -11,7 +11,7 @@ add_library(nszlib MODULE
 target_compile_definitions(nszlib PRIVATE NS_MODINIT=NsZlibModInit)
 target_include_directories(nszlib
     SYSTEM PRIVATE
-        ${CMAKE_BINARY_DIR}/deps/install/include
+        ${DEPS_INSTALL_DIR}/include
         ${ZLIB_INCLUDE_DIRS}
 )
 target_link_libraries(nszlib PRIVATE nsd ZLIB::ZLIB)

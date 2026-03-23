@@ -122,7 +122,8 @@ else()
             no-tests
             no-apps
         BUILD_COMMAND make -j4 build_libs
-        INSTALL_COMMAND make install_sw
+        # install_sw omits openssldir (openssl.cnf); libssl still opens it at runtime (QUIC/TLS).
+        INSTALL_COMMAND ${MAKE_EXECUTABLE} install_sw install_ssldirs
         BUILD_BYPRODUCTS "${OPENSSL_SSL_LIB}" "${OPENSSL_CRYPTO_LIB}"
     )
 

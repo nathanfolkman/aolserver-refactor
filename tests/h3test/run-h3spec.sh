@@ -7,6 +7,8 @@
 #   ./run-h3spec.sh --start-nsd  # picks a free TCP+UDP port, exports H3SPEC_PORT, starts nsd
 #
 # Env:
+#   NSD_SHUTDOWN_WAIT_SEC  max seconds after SIGTERM before SIGKILL (default 45). Prevents CI
+#   hangs if nsd blocks in shutdown (e.g. connection pool wait after QUIC/h2).
 #   Linux: set LD_LIBRARY_PATH to build/nsd:build/nsthread:deps-install/lib (run-h3spec.sh sets
 #   defaults from NSD_BUILD_DIR when --start-nsd). macOS: DYLD_LIBRARY_PATH.
 #   H3SPEC_HOST           default 127.0.0.1
@@ -48,10 +50,21 @@ if [[ "${1:-}" == "--start-nsd" ]]; then
 fi
 
 cleanup() {
-  if [[ -n "${NSD_PID:-}" ]] && kill -0 "$NSD_PID" 2>/dev/null; then
-    kill "$NSD_PID" 2>/dev/null || true
-    wait "$NSD_PID" 2>/dev/null || true
+  if [[ -z "${NSD_PID:-}" ]] || ! kill -0 "$NSD_PID" 2>/dev/null; then
+    return 0
   fi
+  kill -TERM "$NSD_PID" 2>/dev/null || true
+  local i=0
+  local max="${NSD_SHUTDOWN_WAIT_SEC:-45}"
+  while kill -0 "$NSD_PID" 2>/dev/null && (( i < max )); do
+    sleep 1
+    i=$((i + 1))
+  done
+  if kill -0 "$NSD_PID" 2>/dev/null; then
+    echo "run-h3spec: nsd pid $NSD_PID did not exit after ${max}s; sending SIGKILL" >&2
+    kill -KILL "$NSD_PID" 2>/dev/null || true
+  fi
+  wait "$NSD_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
 

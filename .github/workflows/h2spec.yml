@@ -68,6 +68,8 @@ jobs:
           chmod +x h3spec
           sudo install -m755 h3spec /usr/local/bin/
 
+      # run-h3spec.sh stops nsd in EXIT trap with SIGTERM, then SIGKILL after NSD_SHUTDOWN_WAIT_SEC
+      # (default 45s) so the step cannot hang if nsd stalls during pool/driver teardown.
       - name: Run h3spec
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/build-h3/nsd:${{ github.workspace }}/build-h3/nsthread:${{ github.workspace }}/deps-install/lib

@@ -10,6 +10,7 @@
 #   export NS_TCL_LIBRARY="$PWD/deps-install/lib/tcl8.6"
 #
 # Optional: H2SPEC_ARGS="generic/2/1" to run a single case; JUNIT=path for -j report.
+# NSD_SHUTDOWN_WAIT_SEC — max seconds after SIGTERM before SIGKILL when stopping nsd (default 45).
 
 set -eo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -44,10 +45,21 @@ if [[ ${#specs[@]} -gt 0 ]]; then
 fi
 
 cleanup() {
-  if [[ -n "${NSD_PID:-}" ]] && kill -0 "$NSD_PID" 2>/dev/null; then
-    kill "$NSD_PID" 2>/dev/null || true
-    wait "$NSD_PID" 2>/dev/null || true
+  if [[ -z "${NSD_PID:-}" ]] || ! kill -0 "$NSD_PID" 2>/dev/null; then
+    return 0
   fi
+  kill -TERM "$NSD_PID" 2>/dev/null || true
+  local i=0
+  local max="${NSD_SHUTDOWN_WAIT_SEC:-45}"
+  while kill -0 "$NSD_PID" 2>/dev/null && (( i < max )); do
+    sleep 1
+    i=$((i + 1))
+  done
+  if kill -0 "$NSD_PID" 2>/dev/null; then
+    echo "run-h2spec: nsd pid $NSD_PID did not exit after ${max}s; sending SIGKILL" >&2
+    kill -KILL "$NSD_PID" 2>/dev/null || true
+  fi
+  wait "$NSD_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
 

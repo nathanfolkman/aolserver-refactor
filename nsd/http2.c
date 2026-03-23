@@ -539,7 +539,7 @@ static int H2OnFrameRecv(nghttp2_session *session, const nghttp2_frame *frame,
 		 * h2spec (and other clients) send SETTINGS INITIAL_WINDOW_SIZE 65535 in
 		 * the HTTP/2 handshake before later SETTINGS with a smaller IVS. Recording
 		 * the explicit default here sets h2_peer_ivs_value=65535, which triggers
-		 * the dual-default 1-byte probe in H2DataSourceReadLength and then a
+		 * the dual-default 1-byte probe in H2StreamBodyRead and then a
 		 * second read with len=16384 before nghttp2 applies SETTINGS(3) — draining
 		 * the whole body before flow control (h2spec http2/6.9.2/2). Keep 0 until
 		 * a non-default IVS so min(rivs, piv) follows nghttp2 remote settings.
@@ -747,89 +747,15 @@ static void H2SyncPeerIvsFromSession(Sock *sock, nghttp2_session *session);
 static void H2FeedUntilPeerIvsKnown(Sock *sock, nghttp2_session *session);
 
 /*
- * nghttp2_data_source_read_length_callback2: caps the DATA payload size passed
- * into the data source read callback. The library then applies
- * nghttp2_session_enforce_flow_control_limits (min with stream/connection
- * windows). When the peer lowers INITIAL_WINDOW_SIZE, stream->remote_window_size
- * can still reflect the RFC default until the first outbound DATA is accounted
- * for; using the smaller of get_remote_settings(IVS) and the last IVS seen in
- * H2OnFrameRecv aligns chunk sizing with other stacks (nghttp2 examples, h2
- * crates that clamp by SETTINGS) and fixes h2spec http2/6.9.2/2.
+ * Do not register nghttp2_data_source_read_length_callback2. Draining TLS from
+ * inside that callback can apply SETTINGS (INITIAL_WINDOW_SIZE) and change
+ * stream->remote_window_size after session_prep_frame already decided to send
+ * DATA; nghttp2_session_enforce_flow_control_limits then sees a stale requested
+ * length vs updated stream window and returns <= 0, which pack_data treats as
+ * NGHTTP2_ERR_CALLBACK_FAILURE and tears down the session (h2spec generic/2 on a
+ * long-lived connection). IVS and flow control are handled in H2StreamBodyRead
+ * and pre-dispatch drains (H2DispatchDeferred, NsHttp2Feed) instead.
  */
-static nghttp2_ssize
-H2DataSourceReadLength(nghttp2_session *session, uint8_t frame_type,
-	int32_t stream_id, int32_t session_remote_window_size,
-	int32_t stream_remote_window_size, uint32_t remote_max_frame_size,
-	void *user_data)
-{
-    Sock *sock = (Sock *) user_data;
-    nghttp2_ssize want;
-    uint32_t rivs, cap;
-
-    if (frame_type != NGHTTP2_DATA) {
-	return (nghttp2_ssize) remote_max_frame_size;
-    }
-    /*
-     * pack_data snapshots stream/conn windows before calling this callback; if
-     * client SETTINGS (INITIAL_WINDOW_SIZE) are still in the TLS buffer, mem_recv
-     * has not applied them yet and the parameters are stale. Drain and refresh
-     * from the session so want/datamax match the peer IVS before the read
-     * callback runs (h2spec http2/6.9.2/2).
-     */
-    if (sock != NULL && sock->drvPtr != NULL) {
-	H2FeedDrainPendingTls(sock->drvPtr, sock, session);
-    }
-    if (sock != NULL) {
-	H2SyncPeerIvsFromSession(sock, session);
-	H2FeedUntilPeerIvsKnown(sock, session);
-    }
-    want = (nghttp2_ssize) remote_max_frame_size;
-    if (session_remote_window_size >= 0
-	    && (nghttp2_ssize) session_remote_window_size < want) {
-	want = (nghttp2_ssize) session_remote_window_size;
-    }
-    if (stream_remote_window_size >= 0
-	    && (nghttp2_ssize) stream_remote_window_size < want) {
-	want = (nghttp2_ssize) stream_remote_window_size;
-    }
-    rivs = nghttp2_session_get_remote_settings(session,
-	    NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE);
-    cap = rivs;
-    if (sock != NULL && sock->h2_peer_ivs_value > 0u) {
-	cap = sock->h2_peer_ivs_value < cap ? sock->h2_peer_ivs_value : cap;
-    }
-    /*
-     * Always bound by the effective peer IVS (min of session settings and the
-     * last SETTINGS_INITIAL_WINDOW_SIZE from H2OnFrameRecv). The old test
-     * stream_remote_window_size > cap missed the case where the stream window
-     * is still huge but slightly below cap (e.g. 65534 vs 65535) while IVS is
-     * actually 3 — want stayed at 16384, read_callback drained the body, and
-     * h2spec http2/6.9.2/2 saw empty DATA+END_STREAM after WINDOW_UPDATE.
-     */
-    if (stream_id > 0 && cap > 0u && (nghttp2_ssize) cap < want) {
-	want = (nghttp2_ssize) cap;
-    }
-    /*
-     * Until nghttp2 and H2OnFrameRecv both reflect a peer IVS other than the
-     * RFC default, pack_data can run across TLS reads (h2spec 6.9.2/2). Cap to
-     * one byte per DATA frame only while session IVS, recorded SETTINGS IVS,
-     * and the stream remote window all still look like the untouched RFC
-     * defaults (no outbound DATA accounted for yet). After the first byte,
-     * stream_remote_window_size drops below 65535 and normal chunk sizing
-     * resumes even when the peer truly uses IVS 65535.
-     */
-    if (stream_id > 0 && frame_type == NGHTTP2_DATA && sock != NULL
-	    && rivs == NGHTTP2_INITIAL_WINDOW_SIZE
-	    && sock->h2_peer_ivs_value == NGHTTP2_INITIAL_WINDOW_SIZE
-	    && stream_remote_window_size == (int32_t) NGHTTP2_INITIAL_WINDOW_SIZE
-	    && want > (nghttp2_ssize) 1) {
-	want = (nghttp2_ssize) 1;
-    }
-    if (want <= 0) {
-	return (nghttp2_ssize) NGHTTP2_ERR_CALLBACK_FAILURE;
-    }
-    return want;
-}
 
 static nghttp2_session *H2SessionNew(Sock *sock)
 {
@@ -843,8 +769,6 @@ static nghttp2_session *H2SessionNew(Sock *sock)
         return NULL;
     }
     nghttp2_session_callbacks_set_send_callback(callbacks, H2SendCb);
-    nghttp2_session_callbacks_set_data_source_read_length_callback2(callbacks,
-	    H2DataSourceReadLength);
     nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks, H2OnBeginHeaders);
     nghttp2_session_callbacks_set_on_header_callback(callbacks, H2OnHeader);
     nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, H2OnDataChunk);

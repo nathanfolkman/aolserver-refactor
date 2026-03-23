@@ -1666,6 +1666,27 @@ NsHttp3DriverShutdown(Driver *drv)
     drv->quic.enabled = 0;
 }
 
+/*
+ * Grow HTTP/3 response body buffer for streaming DATA.
+ */
+static int
+H3AppendBody(Conn *connPtr, const char *p, size_t len)
+{
+    unsigned char *q;
+
+    if (len == 0u) {
+	return 0;
+    }
+    q = ns_realloc(connPtr->h3_write_buf, connPtr->h3_write_len + len);
+    if (q == NULL) {
+	return -1;
+    }
+    connPtr->h3_write_buf = q;
+    memcpy(connPtr->h3_write_buf + connPtr->h3_write_len, p, len);
+    connPtr->h3_write_len += len;
+    return 0;
+}
+
 static nghttp3_ssize
 h3_read_resp_data(nghttp3_conn *conn, int64_t stream_id, nghttp3_vec *vec,
     size_t veccnt, uint32_t *pflags, void *conn_user_data,
@@ -1681,6 +1702,9 @@ h3_read_resp_data(nghttp3_conn *conn, int64_t stream_id, nghttp3_vec *vec,
     }
     if (connPtr->h3_write_buf == NULL
 	    || connPtr->h3_write_off >= connPtr->h3_write_len) {
+	if (connPtr->h3_flush_mode == 1) {
+	    return NGHTTP3_ERR_WOULDBLOCK;
+	}
 	*pflags |= NGHTTP3_DATA_FLAG_EOF;
 	vec[0].len = 0;
 	return 1;
@@ -1693,13 +1717,19 @@ h3_read_resp_data(nghttp3_conn *conn, int64_t stream_id, nghttp3_vec *vec,
     vec[0].len = n;
     connPtr->h3_write_off += n;
     if (connPtr->h3_write_off >= connPtr->h3_write_len) {
+	if (connPtr->h3_flush_mode == 1) {
+	    ns_free(connPtr->h3_write_buf);
+	    connPtr->h3_write_buf = NULL;
+	    connPtr->h3_write_len = connPtr->h3_write_off = 0u;
+	    return NGHTTP3_ERR_WOULDBLOCK;
+	}
 	*pflags |= NGHTTP3_DATA_FLAG_EOF;
     }
     return 1;
 }
 
 int
-NsHttp3ConnFlushDirect(Ns_Conn *conn, char *buf, int len)
+NsHttp3ConnFlushDirect(Ns_Conn *conn, char *buf, int len, int stream)
 {
     Conn *connPtr = (Conn *) conn;
     NsH3Conn *hc = connPtr->h3_handler;
@@ -1709,6 +1739,11 @@ NsHttp3ConnFlushDirect(Ns_Conn *conn, char *buf, int len)
     char statbuf[8];
     int rv;
 
+    /*
+     * stream: non-zero => more Ns_ConnFlushDirect calls follow; zero => last
+     * body chunk (RFC 9114 response DATA / FIN).
+     */
+    connPtr->h3_flush_mode = stream ? 1 : 0;
     if (hc == NULL || hc->httpconn == NULL) {
 	return NS_ERROR;
     }
@@ -1737,9 +1772,10 @@ NsHttp3ConnFlushDirect(Ns_Conn *conn, char *buf, int len)
 	connPtr->h3_write_len = 0u;
 	connPtr->h3_write_off = 0u;
 	if (buf != NULL && len > 0 && !(conn->flags & NS_CONN_SKIPBODY)) {
-	    connPtr->h3_write_buf = ns_malloc((size_t) len);
-	    memcpy(connPtr->h3_write_buf, buf, (size_t) len);
-	    connPtr->h3_write_len = (size_t) len;
+	    if (H3AppendBody(connPtr, buf, (size_t) len) != 0) {
+		ns_free(nva);
+		return NS_ERROR;
+	    }
 	}
 	nghttp3_conn_set_stream_user_data(hc->httpconn, connPtr->h3_stream_id,
 	    connPtr);
@@ -1757,6 +1793,14 @@ NsHttp3ConnFlushDirect(Ns_Conn *conn, char *buf, int len)
 	    return NS_ERROR;
 	}
 	connPtr->h3_response_started = 1;
+    } else if (!(conn->flags & NS_CONN_SKIPBODY) && len > 0) {
+	if (H3AppendBody(connPtr, buf, (size_t) len) != 0) {
+	    return NS_ERROR;
+	}
+	rv = nghttp3_conn_unblock_stream(hc->httpconn, connPtr->h3_stream_id);
+	if (rv != 0 && rv != NGHTTP3_ERR_STREAM_NOT_FOUND) {
+	    return NS_ERROR;
+	}
     }
     if (h3_write_streams(hc) != 0) {
 	return NS_ERROR;
@@ -1768,7 +1812,7 @@ int
 NsHttp3ConnSend(Conn *connPtr, struct iovec *bufs, int nbufs)
 {
     Ns_Conn *conn = (Ns_Conn *) connPtr;
-    int towrite = 0, i, rc;
+    int towrite = 0, i, rc, sm;
     char *merged;
     size_t off, oblen;
 
@@ -1776,12 +1820,14 @@ NsHttp3ConnSend(Conn *connPtr, struct iovec *bufs, int nbufs)
 	towrite += (int) bufs[i].iov_len;
     }
     oblen = (size_t) connPtr->obuf.length;
-    if (connPtr->h3_response_started) {
-	return -1;
+    sm = connPtr->h3_flush_mode;
+    if (sm < 0) {
+	sm = 0;
     }
+    connPtr->h3_flush_mode = -1;
     if (oblen == 0u && towrite == 0) {
 	if (conn->flags & NS_CONN_SENTHDRS) {
-	    rc = NsHttp3ConnFlushDirect(conn, NULL, 0);
+	    rc = NsHttp3ConnFlushDirect(conn, NULL, 0, sm);
 	    return rc == NS_OK ? 0 : -1;
 	}
 	return 0;
@@ -1799,7 +1845,7 @@ NsHttp3ConnSend(Conn *connPtr, struct iovec *bufs, int nbufs)
 	}
     }
     Tcl_DStringTrunc(&connPtr->obuf, 0);
-    rc = NsHttp3ConnFlushDirect(conn, merged, (int) off);
+    rc = NsHttp3ConnFlushDirect(conn, merged, (int) off, sm);
     ns_free(merged);
     return rc == NS_OK ? (int) off : -1;
 }

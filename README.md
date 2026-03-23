@@ -2,6 +2,22 @@
 
 Upstream-style notes remain in [README](README). This document covers **this tree**: CMake builds, TLS **HTTP/2**, optional **HTTP/3 (QUIC)**, and how to verify behavior. For a short HTTP/2/3 pointer and historical context, see [http23.md](http23.md) — **operational truth is here** (http23.md defers to this file for current numbers and procedures).
 
+### Goals: interop vs “full” standards breadth
+
+This tree prioritizes **protocol interop and automated conformance** (h2spec, h3spec) for typical **request/response** workloads. **Optional** HTTP/2/3 features (server push, extended CONNECT, priority trees, 0-RTT policy, connection migration, etc.) are either **not implemented** or **explicitly out of scope** unless listed below.
+
+### Supported today vs not guaranteed
+
+| Area | Supported | Not implemented / not guaranteed |
+|------|-----------|----------------------------------|
+| **HTTP/2** | ALPN `h2`, multiplexed streams, tunable **SETTINGS** (`h2_*` in nsssl), HPACK, request dispatch, **incremental response DATA** (chunked `Ns_ConnFlush` / `stream` flag feeds nghttp2 with `DEFERRED` + `resume_data`) | Server **push** (`PUSH_PROMISE`) end-to-end; RFC priority trees; extended CONNECT |
+| **HTTP/3** | QUIC + **nghttp3**, QPACK, control/QPACK streams, **incremental response DATA** (same `Ns_ConnFlush` semantics + `nghttp3_conn_unblock_stream`) | HTTP/3 **push**; 0-RTT server policy; migration |
+| **HTTP/1.1** | Plain **nssock**, existing Tcl pages and `tests/new/http.test` | No bundled third-party “full RFC” machine suite in CI (see **CI regression** below) |
+| **Trailers** | Inbound trailer **HEADERS** on H2 can complete a stream (see `http2.c`); HTTP/1 chunked trailers | Outbound **response** trailers on H2/H3 are **not** fully unified with chunked trailer encoding—avoid relying on gRPC-style trailing metadata until audited for your app |
+| **Shutdown** | `shutdowntimeout` (default 20s) bounds pool wait; test scripts use **SIGKILL** after **`NSD_SHUTDOWN_WAIT_SEC`** | Connection threads may still log **timeout waiting for connection thread exit** under load; treat as operational tuning, not a silent guarantee |
+
+Bundled **dependency patches** (nghttp2, ngtcp2) are tracked in [cmake/patches/README.md](cmake/patches/README.md).
+
 ## Building
 
 From the repository root (with dependencies fetched by CMake as configured in this project):
@@ -83,6 +99,27 @@ Optional parameters on the **nsssl** driver module (same section as `recvwait`, 
 
 If **no** `h2_*` SETTINGS keys are set, the server preface uses an empty SETTINGS payload (defaults). If **any** SETTINGS key is set, only those keys are sent in the initial SETTINGS frame (omit parameters you want left at defaults).
 
+#### Server push (policy)
+
+Server **push** (`PUSH_PROMISE` and pushed request streams) is **not implemented** end-to-end. **Do not** set `h2_enable_push` expecting push responses from Tcl or filters. **Only** set `h2_enable_push` to `0` when you need an explicit `SETTINGS_ENABLE_PUSH` entry in the server preface; **omit** the key when you have no preference (RFC 7540 defines an initial value for this setting; consult your client if you must prove push is disabled on the wire). **HTTP/3 push** is not implemented.
+
+#### Operational limits (reference)
+
+| Mechanism | Role |
+|-----------|------|
+| `maxconnections` | Per-server cap on queued connections (`ns_param` in `ns/server` / `tcl/pools.tcl`; see examples). |
+| `shutdowntimeout` | Global `ns_param` (seconds): how long shutdown waits for connection threads (`nsd/nsconf.c`, `nsd/nsmain.c`). |
+| `h2_*` SETTINGS | Flow control, frame size, header list size, HPACK encoder limits (table above). |
+| HTTP/3 QUIC | `h3=1` plus `h3_max_streams_bidi`, `h3_max_idle_timeout_ms`, `h3_max_tx_udp_payload_size`, `h3_udp_port` on the **nsssl** module path; defaults and internal caps are set in `NsHttp3DriverInit` in `nsd/http3_body.inc`. |
+
+Under heavy load, pool shutdown can still log **timeout waiting for connection thread exit** (`nsd/pools.c`); combine `shutdowntimeout` tuning with ensuring QUIC/TLS connections drain (test scripts use **`NSD_SHUTDOWN_WAIT_SEC`** then **SIGKILL** as a backstop—see **h3spec** / **h2spec** helpers).
+
+#### Trailers (audit summary)
+
+- **HTTP/1.1:** `Ns_ConnFlushDirect` uses **chunked** encoding and a final `0\r\n\r\n` when `NS_CONN_CHUNK` is set (`nsd/connio.c`); that path is **not** used for `NS_CONN_HTTP2` / `NS_CONN_HTTP3` (chunk flags are skipped for H2/H3).
+- **Inbound HTTP/2:** Trailer `HEADERS` frames are processed in the nghttp2 receive path (`nsd/http2.c`); end-of-stream handling should complete dispatch when appropriate.
+- **Outbound H2/H3:** Response **trailers** are not wired the same way as HTTP/1 chunked trailers; do not assume gRPC-style trailing metadata without verifying your specific filters and header builders (`BuildResponseNv` / `http3_body.inc`). Prefer a single response header block plus streaming **DATA** for typical APIs.
+
 ### HTTP/2 observability
 
 Counters are maintained **both** process-wide (sum of all drivers) and **per driver** (TLS `h2` traffic accepted by that driver, e.g. `s1/nsssl`). RST/GOAWAY/PING **sent** counts come from nghttp2’s **frame-send** callback; **received** counts from **frame-recv**. `defer_*` tracks deferred stream dispatch (request completed in the reader, queued for the driver). `bytes_fed` is application plaintext bytes passed to `mem_recv`; `trysend_drain_reads` counts `DriverRecv`+`mem_recv` cycles inside `NsHttp2TrySend` while `want_write` stays true.
@@ -101,6 +138,8 @@ On push/PR to `main` or `master`, **GitHub Actions** (`.github/workflows/h2spec.
 1. **`tls-h2spec-http1`** — CMake **`-DNS_WITH_V8=OFF -DNS_USE_SYSTEM_OPENSSL=ON`**, **`openssl`**, **`libssl-dev`**, **`zlib1g-dev`**, **`tcl`** (for **`tests/new/http.test`**), **`ninja`**, etc.; **`h2spec`** and **`tests/h2test/run-h2spec.sh --start-nsd`** (120s per-case timeout); then **`tests/h1test/run-http1-tests.sh --start-nsd`** (**`curl`** HTTP/1.1 and HTTP/1.0 smoke plus legacy **`tests/new/http.test`** against plain **nssock**). The h2 job avoids building **`openssl_ep`** on the runner.
 
 2. **`tls-h3spec`** — separate job: **`-DNS_WITH_HTTP3=ON`** (bundled OpenSSL 3.5+ for QUIC; no **`NS_USE_SYSTEM_OPENSSL`**), **`python3`** for port selection, **`h3spec`** [v0.1.13](https://github.com/kazu-yamamoto/h3spec/releases/tag/v0.1.13) **`h3spec-linux-x86_64`**, and **`tests/h3test/run-h3spec.sh --start-nsd`**.
+
+**HTTP/1.1 in CI:** The **`tls-h2spec-http1`** job is **not** a third-party “full RFC 7230” conformance suite. It runs **curl** + legacy HTTP/1.0/1.1 smoke scripts and **`tests/new/http.test`** against plain **nssock**—enough to catch regressions in the classic stack, not a machine-verified coverage of every optional HTTP/1 feature.
 
 Local builds still use the bundled OpenSSL 3.5 tree by default; **`-DNS_USE_SYSTEM_OPENSSL=ON`** is optional when HTTP/3 is off. Adjust branches in the workflow file if your default branch differs.
 

@@ -2800,6 +2800,12 @@ AllocConn(Driver *drvPtr, Ns_Time *nowPtr, Sock *sockPtr)
     strcpy(connPtr->peer, ns_inet_ntoa(sockPtr->sa.sin_addr));
     connPtr->times.accept = sockPtr->acceptTime;
     connPtr->sockPtr = sockPtr;
+#if HAVE_NGHTTP2
+    connPtr->http2_flush_mode = -1;
+#endif
+#if HAVE_NGHTTP3
+    connPtr->h3_flush_mode = -1;
+#endif
 
     return connPtr;
 }
@@ -2975,6 +2981,12 @@ FreeConn(Conn *connPtr)
         ns_free(connPtr->content);
         connPtr->content = NULL;
     }
+#if HAVE_NGHTTP2
+    if (connPtr->h2_body_buf != NULL) {
+	ns_free(connPtr->h2_body_buf);
+	connPtr->h2_body_buf = NULL;
+    }
+#endif
 #if HAVE_NGHTTP3
     NsHttp3ConnDetach(connPtr);
     if ((connPtr->flags & NS_CONN_H3_BODY) && connPtr->content != NULL) {

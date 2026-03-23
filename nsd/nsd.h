@@ -578,10 +578,21 @@ typedef struct Conn {
     void *http2_session; /* nghttp2_session * */
     int32_t http2_stream_id;
     int http2_response_started; /* 1 after first nghttp2_submit_response */
+    /*
+     * HTTP/2 response body streaming: nghttp2 data source reads from h2_body_*.
+     * http2_flush_mode: -1 = unset (Ns_ConnSend infers final), 0 = final chunk,
+     * 1 = more chunks follow (from Ns_ConnFlushDirect stream flag).
+     */
+    int8_t http2_flush_mode;
+    int http2_chunk_more; /* last NsHttp2ConnFlushDirect stream arg (0=final) */
+    char *h2_body_buf;
+    size_t h2_body_len;
+    size_t h2_body_rd;
 #if HAVE_NGHTTP3
     void *h3_handler; /* NsH3Conn * */
     int64_t h3_stream_id;
     int h3_response_started;
+    int8_t h3_flush_mode; /* -1 unset, 0 final, 1 more (matches Ns_ConnFlushDirect stream) */
     unsigned char *h3_write_buf;
     size_t h3_write_len;
     size_t h3_write_off;
@@ -1010,7 +1021,7 @@ extern int NsHttp3DriverInit(Driver *drv, const char *configPath);
 extern void NsHttp3DriverShutdown(Driver *drv);
 extern void NsHttp3DriverStatsGet(Driver *drvPtr, NsHttp3Stats *outPtr);
 extern int NsHttp3ConnSend(Conn *connPtr, struct iovec *bufs, int nbufs);
-extern int NsHttp3ConnFlushDirect(Ns_Conn *conn, char *buf, int len);
+extern int NsHttp3ConnFlushDirect(Ns_Conn *conn, char *buf, int len, int stream);
 extern void NsHttp3ConnDetach(Conn *connPtr);
 extern SOCKET Ns_SockUdpListen(char *address, int port);
 #endif

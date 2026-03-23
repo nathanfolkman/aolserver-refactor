@@ -211,6 +211,7 @@ Ns_ConnFlush(Ns_Conn *conn, char *buf, int len, int stream)
 int
 Ns_ConnFlushDirect(Ns_Conn *conn, char *buf, int len, int stream)
 {
+    Conn *connPtr = (Conn *) conn;
     struct iovec iov[4];
     int i, nwrote, towrite, hlen, ioc;
     char hdr[100];
@@ -283,6 +284,16 @@ Ns_ConnFlushDirect(Ns_Conn *conn, char *buf, int len, int stream)
      * connection.
      */
 
+#if HAVE_NGHTTP2
+    if (conn->flags & NS_CONN_HTTP2) {
+	connPtr->http2_flush_mode = stream ? 1 : 0;
+    }
+#endif
+#if HAVE_NGHTTP3
+    if (conn->flags & NS_CONN_HTTP3) {
+	connPtr->h3_flush_mode = stream ? 1 : 0;
+    }
+#endif
     nwrote = Ns_ConnSend(conn, iov, ioc);
     if (nwrote != towrite) {
     	return NS_ERROR;
@@ -353,7 +364,7 @@ Ns_ConnSend(Ns_Conn *conn, struct iovec *bufs, int nbufs)
 	connPtr->nContentSent += n;
 	/*
 	 * Do not run NS_FILTER_WRITE for HTTP/2: filters often issue another
-	 * Ns_ConnSend, but we submit exactly one nghttp2 response per stream.
+	 * Ns_ConnSend; responses use nghttp2 DATA with optional streaming.
 	 */
 	return n;
     }

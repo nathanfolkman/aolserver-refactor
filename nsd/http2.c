@@ -1224,6 +1224,65 @@ typedef struct {
     char *owned; /* response body copy; freed after nghttp2 finishes DATA */
 } H2DataSrc;
 
+/*
+ * Append bytes to the HTTP/2 response body buffer (streaming DATA frames).
+ */
+static int
+H2AppendBody(Conn *connPtr, const char *p, size_t len)
+{
+    char *q;
+
+    if (len == 0u) {
+	return 0;
+    }
+    q = ns_realloc(connPtr->h2_body_buf, connPtr->h2_body_len + len);
+    if (q == NULL) {
+	return -1;
+    }
+    connPtr->h2_body_buf = q;
+    memcpy(connPtr->h2_body_buf + connPtr->h2_body_len, p, len);
+    connPtr->h2_body_len += len;
+    return 0;
+}
+
+/*
+ * nghttp2_data_source read callback: sends DATA from h2_body_buf with flow
+ * control; returns DEFERRED when the chunk is drained and more body follows.
+ */
+static ssize_t
+H2StreamBodyRead(nghttp2_session *session, int32_t stream_id, uint8_t *buf,
+		 size_t length, uint32_t *data_flags,
+		 nghttp2_data_source *source, void *user_data)
+{
+    Conn *connPtr = (Conn *) source->ptr;
+    size_t avail, n;
+
+    (void) session;
+    (void) stream_id;
+    (void) user_data;
+    avail = connPtr->h2_body_len - connPtr->h2_body_rd;
+    if (avail > 0u) {
+	n = length < avail ? length : avail;
+	memcpy(buf, connPtr->h2_body_buf + connPtr->h2_body_rd, n);
+	connPtr->h2_body_rd += n;
+	if (connPtr->h2_body_rd >= connPtr->h2_body_len) {
+	    ns_free(connPtr->h2_body_buf);
+	    connPtr->h2_body_buf = NULL;
+	    connPtr->h2_body_len = connPtr->h2_body_rd = 0u;
+	    if (connPtr->http2_chunk_more) {
+		return (ssize_t) NGHTTP2_ERR_DEFERRED;
+	    }
+	    *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+	}
+	return (ssize_t) n;
+    }
+    if (connPtr->http2_chunk_more) {
+	return (ssize_t) NGHTTP2_ERR_DEFERRED;
+    }
+    *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+    return 0;
+}
+
 static ssize_t H2DataRead(nghttp2_session *session, int32_t stream_id, uint8_t *buf,
                           size_t length, uint32_t *data_flags,
                           nghttp2_data_source *source, void *user_data)
@@ -1267,9 +1326,8 @@ NsHttp2ConnFlushDirect(Ns_Conn *conn, char *buf, int len, int stream)
     Sock *sock;
     nghttp2_nv *nva = NULL;
     size_t nnv = 0;
-    H2DataSrc *ds = NULL;
     nghttp2_data_provider provider;
-    int niov = 0, rv;
+    int rv;
 
     if (connPtr->sockPtr == NULL) {
 	return NS_ERROR;
@@ -1287,72 +1345,68 @@ NsHttp2ConnFlushDirect(Ns_Conn *conn, char *buf, int len, int stream)
 	return NS_ERROR;
     }
 
+    /*
+     * stream: non-zero => more Ns_ConnFlushDirect calls will follow (chunked);
+     * zero => last body chunk for this response.
+     */
+    connPtr->http2_chunk_more = stream ? 1 : 0;
+
     if (!connPtr->http2_response_started) {
         BuildResponseNv(conn, &nva, &nnv);
         if (!(conn->flags & NS_CONN_SKIPBODY) && len > 0) {
-            niov = 1;
-            ds = (H2DataSrc *) ns_calloc(1, sizeof(H2DataSrc));
-            ds->owned = ns_malloc((size_t) len);
-            memcpy(ds->owned, buf, (size_t) len);
-            ds->bufs = ns_malloc(sizeof(struct iovec));
-            ds->bufs[0].iov_base = ds->owned;
-            ds->bufs[0].iov_len = (size_t) len;
-            ds->nbufs = niov;
-            provider.source.ptr = ds;
-            provider.read_callback = H2DataRead;
-            rv = nghttp2_submit_response(session, connPtr->http2_stream_id,
-                                         nva, nnv, &provider);
+	    if (H2AppendBody(connPtr, buf, (size_t) len) != 0) {
+		FreeNvArray(nva, nnv);
+		H2WakeDriverIfPending(sock, session);
+		Ns_MutexUnlock(&sock->h2Lock);
+		return NS_ERROR;
+	    }
+	    memset(&provider, 0, sizeof(provider));
+	    provider.source.ptr = connPtr;
+	    provider.read_callback = H2StreamBodyRead;
+	    rv = nghttp2_submit_response(session, connPtr->http2_stream_id,
+		    nva, nnv, &provider);
         } else if (!(conn->flags & NS_CONN_SKIPBODY) && connPtr->obuf.length > 0) {
-            niov = 1;
-            ds = (H2DataSrc *) ns_calloc(1, sizeof(H2DataSrc));
-            ds->owned = ns_malloc((size_t) connPtr->obuf.length);
-            memcpy(ds->owned, connPtr->obuf.string,
-                   (size_t) connPtr->obuf.length);
-            ds->bufs = ns_malloc(sizeof(struct iovec));
-            ds->bufs[0].iov_base = ds->owned;
-            ds->bufs[0].iov_len = (size_t) connPtr->obuf.length;
-            ds->nbufs = niov;
-            provider.source.ptr = ds;
-            provider.read_callback = H2DataRead;
-            rv = nghttp2_submit_response(session, connPtr->http2_stream_id,
-                                         nva, nnv, &provider);
+	    if (H2AppendBody(connPtr, connPtr->obuf.string,
+			(size_t) connPtr->obuf.length) != 0) {
+		FreeNvArray(nva, nnv);
+		H2WakeDriverIfPending(sock, session);
+		Ns_MutexUnlock(&sock->h2Lock);
+		return NS_ERROR;
+	    }
+	    memset(&provider, 0, sizeof(provider));
+	    provider.source.ptr = connPtr;
+	    provider.read_callback = H2StreamBodyRead;
+	    rv = nghttp2_submit_response(session, connPtr->http2_stream_id,
+		    nva, nnv, &provider);
         } else {
             rv = nghttp2_submit_response(session, connPtr->http2_stream_id,
                                          nva, nnv, NULL);
         }
         FreeNvArray(nva, nnv);
         if (rv != 0) {
-            if (ds != NULL) {
-                ns_free(ds->bufs);
-                ns_free(ds->owned);
-                ns_free(ds);
-            }
 	    H2WakeDriverIfPending(sock, session);
             Ns_MutexUnlock(&sock->h2Lock);
             return NS_ERROR;
         }
         connPtr->http2_response_started = 1;
     } else if (!(conn->flags & NS_CONN_SKIPBODY) && len > 0) {
-        /* Single nghttp2 response per request; streaming uses one merged write. */
-	H2WakeDriverIfPending(sock, session);
-        Ns_MutexUnlock(&sock->h2Lock);
-        return NS_ERROR;
+	if (H2AppendBody(connPtr, buf, (size_t) len) != 0) {
+	    H2WakeDriverIfPending(sock, session);
+	    Ns_MutexUnlock(&sock->h2Lock);
+	    return NS_ERROR;
+	}
+	rv = nghttp2_session_resume_data(session, connPtr->http2_stream_id);
+	if (rv != 0 && rv != NGHTTP2_ERR_INVALID_ARGUMENT) {
+	    H2WakeDriverIfPending(sock, session);
+	    Ns_MutexUnlock(&sock->h2Lock);
+	    return NS_ERROR;
+	}
     }
 
     if (H2SessionSendAll(sock, session) != 0) {
-        if (ds != NULL) {
-            ns_free(ds->bufs);
-            ns_free(ds->owned);
-            ns_free(ds);
-        }
 	H2WakeDriverIfPending(sock, session);
         Ns_MutexUnlock(&sock->h2Lock);
         return NS_ERROR;
-    }
-    if (ds != NULL) {
-        ns_free(ds->bufs);
-        ns_free(ds->owned);
-        ns_free(ds);
     }
     Tcl_DStringTrunc(&connPtr->obuf, 0);
 
@@ -1365,7 +1419,7 @@ int
 NsHttp2ConnSend(Conn *connPtr, struct iovec *bufs, int nbufs)
 {
     Ns_Conn *conn = (Ns_Conn *) connPtr;
-    int towrite = 0, i, rc;
+    int towrite = 0, i, rc, sm;
     char *merged;
     size_t off, oblen;
 
@@ -1373,16 +1427,18 @@ NsHttp2ConnSend(Conn *connPtr, struct iovec *bufs, int nbufs)
         towrite += (int) bufs[i].iov_len;
     }
     oblen = (size_t) connPtr->obuf.length;
-    if (connPtr->http2_response_started) {
-        return -1;
+    sm = connPtr->http2_flush_mode;
+    if (sm < 0) {
+	sm = 0;
     }
+    connPtr->http2_flush_mode = -1;
     /*
      * Ns_ConnFlushHeaders queues metadata (SENTHDRS) but skips obuf for HTTP/2;
      * Ns_WriteConn(..., 0) must still submit HEADERS (e.g. HEAD / fastpath).
      */
     if (oblen == 0u && towrite == 0) {
 	if (conn->flags & NS_CONN_SENTHDRS) {
-	    rc = NsHttp2ConnFlushDirect(conn, NULL, 0, 1);
+	    rc = NsHttp2ConnFlushDirect(conn, NULL, 0, sm);
 	    return rc == NS_OK ? 0 : -1;
 	}
 	return 0;
@@ -1400,7 +1456,7 @@ NsHttp2ConnSend(Conn *connPtr, struct iovec *bufs, int nbufs)
         }
     }
     Tcl_DStringTrunc(&connPtr->obuf, 0);
-    rc = NsHttp2ConnFlushDirect(conn, merged, (int) off, 1);
+    rc = NsHttp2ConnFlushDirect(conn, merged, (int) off, sm);
     ns_free(merged);
     return rc == NS_OK ? (int) off : -1;
 }

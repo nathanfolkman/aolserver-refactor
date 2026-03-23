@@ -12,7 +12,9 @@ ExternalProject_Add(nghttp2_ep
     URL_HASH SHA256=aa7594c846e56a22fbf3d6e260e472268808d3b49d5e0ed339f589e9cc9d484c
     # h2spec http2/7.2: default libnghttp2 server sends GOAWAY after 1000 inbound
     # RST_STREAM frames on one connection; a full h2spec run exceeds that before §7.2.
+    # h2spec 5.1.7: unexpected CONTINUATION must be RST STREAM_CLOSED, not connection close.
     PATCH_COMMAND patch -d <SOURCE_DIR> -p1 -i "${CMAKE_CURRENT_LIST_DIR}/patches/nghttp2-1.61.0-disable-stream-reset-goaway.patch"
+        && patch -d <SOURCE_DIR> -p1 -i "${CMAKE_CURRENT_LIST_DIR}/patches/nghttp2-1.61.0-unexpected-continuation-rst.patch"
     INSTALL_DIR "${DEPS_INSTALL_DIR}"
     BUILD_IN_SOURCE 1
     CONFIGURE_COMMAND <SOURCE_DIR>/configure --prefix=<INSTALL_DIR>

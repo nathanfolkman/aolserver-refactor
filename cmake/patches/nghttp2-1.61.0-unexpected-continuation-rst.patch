@@ -1,0 +1,27 @@
+--- a/lib/nghttp2_session.c
++++ b/lib/nghttp2_session.c
+@@ -6273,15 +6273,19 @@
+       case NGHTTP2_CONTINUATION:
+         DEBUGF("recv: unexpected CONTINUATION\n");
+ 
+-        /* Receiving CONTINUATION in this state are subject to
+-           connection error of type PROTOCOL_ERROR */
+-        rv = nghttp2_session_terminate_session_with_reason(
+-            session, NGHTTP2_PROTOCOL_ERROR, "CONTINUATION: unexpected");
++        /* RFC 7540 5.1: extra frames on half-closed (remote) require a stream
++           error with STREAM_CLOSED. Orphaned CONTINUATION matches; h2spec 5.1.7.
++           (Upstream used a connection-level PROTOCOL_ERROR here.) */
++        rv = session_handle_invalid_stream2(
++            session, iframe->frame.hd.stream_id, &iframe->frame,
++            NGHTTP2_ERR_STREAM_CLOSED);
+         if (nghttp2_is_fatal(rv)) {
+           return rv;
+         }
+ 
+-        return (nghttp2_ssize)inlen;
++        busy = 1;
++        iframe->state = NGHTTP2_IB_IGN_PAYLOAD;
++        break;
+       default:
+         DEBUGF("recv: extension frame\n");
+ 

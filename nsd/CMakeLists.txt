@@ -40,6 +40,9 @@ if(NS_WITH_HTTP3)
         OpenSSL::Crypto
     )
     add_dependencies(nsd nghttp3_ep ngtcp2_ep)
+    if(NOT NS_USE_SYSTEM_OPENSSL)
+        add_dependencies(nsd openssl_ep)
+    endif()
 endif()
 set_target_properties(nsd PROPERTIES
     OUTPUT_NAME nsd

@@ -112,10 +112,12 @@ else()
         # openssl(1) CLI can fail linking on some Linux CI images; skip it.
         # build_libs: build only libcrypto/libssl (do not run the default target, which
         # can still build apps on some toolchains if configure is cached incorrectly).
+        # OpenSSL 3 may default to lib64/ on 64-bit Linux; IMPORTED targets use lib/ — force lib/.
         CONFIGURE_COMMAND <SOURCE_DIR>/Configure
             ${OPENSSL_TARGET}
             --prefix=<INSTALL_DIR>
             --openssldir=<INSTALL_DIR>/ssl
+            --libdir=lib
             shared
             no-tests
             no-apps

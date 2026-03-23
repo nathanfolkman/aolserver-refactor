@@ -512,6 +512,44 @@ static int H2OnFrameRecv(nghttp2_session *session, const nghttp2_frame *frame,
     (void) session;
     if (frame->hd.type == NGHTTP2_PING) {
 	H2_DUAL_INC(sock->drvPtr, ping_recv);
+    } else if (frame->hd.type == NGHTTP2_SETTINGS
+	    && (frame->hd.flags & NGHTTP2_FLAG_ACK) == 0) {
+	size_t si;
+
+	for (si = 0; si < frame->settings.niv; si++) {
+	    if (frame->settings.iv[si].settings_id
+		    == NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE) {
+		uint32_t v = frame->settings.iv[si].value;
+
+		/*
+		 * Some clients emit SETTINGS with an explicit
+		 * INITIAL_WINDOW_SIZE of 65535 (RFC default) after sending a
+		 * smaller IVS. Last value wins in nghttp2, but treating the
+		 * redundant 65535 as authoritative would undo our min(rivs, piv)
+		 * caps in H2DataSourceReadLength / H2StreamBodyRead and drain
+		 * the whole body before WINDOW_UPDATE (h2spec http2/6.9.2/2).
+		 * Keep the smaller recorded IVS until the peer sends a
+		 * non-default value again.
+		 */
+		if (v == NGHTTP2_INITIAL_WINDOW_SIZE && sock->h2_peer_ivs_value != 0u
+			&& sock->h2_peer_ivs_value < NGHTTP2_INITIAL_WINDOW_SIZE) {
+		    continue;
+		}
+		/*
+		 * h2spec (and other clients) send SETTINGS INITIAL_WINDOW_SIZE 65535 in
+		 * the HTTP/2 handshake before later SETTINGS with a smaller IVS. Recording
+		 * the explicit default here sets h2_peer_ivs_value=65535, which triggers
+		 * the dual-default 1-byte probe in H2DataSourceReadLength and then a
+		 * second read with len=16384 before nghttp2 applies SETTINGS(3) — draining
+		 * the whole body before flow control (h2spec http2/6.9.2/2). Keep 0 until
+		 * a non-default IVS so min(rivs, piv) follows nghttp2 remote settings.
+		 */
+		if (v == NGHTTP2_INITIAL_WINDOW_SIZE && sock->h2_peer_ivs_value == 0u) {
+		    continue;
+		}
+		sock->h2_peer_ivs_value = v;
+	    }
+	}
     } else if (frame->hd.type == NGHTTP2_GOAWAY) {
 	H2_DUAL_INC(sock->drvPtr, goaway_recv);
     } else if (frame->hd.type == NGHTTP2_RST_STREAM) {
@@ -703,6 +741,96 @@ H2SubmitPrefaceSettings(nghttp2_session *session, Sock *sock)
     return rv;
 }
 
+static void H2FeedDrainPendingTls(Driver *drvPtr, Sock *sockPtr,
+				  nghttp2_session *session);
+static void H2SyncPeerIvsFromSession(Sock *sock, nghttp2_session *session);
+static void H2FeedUntilPeerIvsKnown(Sock *sock, nghttp2_session *session);
+
+/*
+ * nghttp2_data_source_read_length_callback2: caps the DATA payload size passed
+ * into the data source read callback. The library then applies
+ * nghttp2_session_enforce_flow_control_limits (min with stream/connection
+ * windows). When the peer lowers INITIAL_WINDOW_SIZE, stream->remote_window_size
+ * can still reflect the RFC default until the first outbound DATA is accounted
+ * for; using the smaller of get_remote_settings(IVS) and the last IVS seen in
+ * H2OnFrameRecv aligns chunk sizing with other stacks (nghttp2 examples, h2
+ * crates that clamp by SETTINGS) and fixes h2spec http2/6.9.2/2.
+ */
+static nghttp2_ssize
+H2DataSourceReadLength(nghttp2_session *session, uint8_t frame_type,
+	int32_t stream_id, int32_t session_remote_window_size,
+	int32_t stream_remote_window_size, uint32_t remote_max_frame_size,
+	void *user_data)
+{
+    Sock *sock = (Sock *) user_data;
+    nghttp2_ssize want;
+    uint32_t rivs, cap;
+
+    if (frame_type != NGHTTP2_DATA) {
+	return (nghttp2_ssize) remote_max_frame_size;
+    }
+    /*
+     * pack_data snapshots stream/conn windows before calling this callback; if
+     * client SETTINGS (INITIAL_WINDOW_SIZE) are still in the TLS buffer, mem_recv
+     * has not applied them yet and the parameters are stale. Drain and refresh
+     * from the session so want/datamax match the peer IVS before the read
+     * callback runs (h2spec http2/6.9.2/2).
+     */
+    if (sock != NULL && sock->drvPtr != NULL) {
+	H2FeedDrainPendingTls(sock->drvPtr, sock, session);
+    }
+    if (sock != NULL) {
+	H2SyncPeerIvsFromSession(sock, session);
+	H2FeedUntilPeerIvsKnown(sock, session);
+    }
+    want = (nghttp2_ssize) remote_max_frame_size;
+    if (session_remote_window_size >= 0
+	    && (nghttp2_ssize) session_remote_window_size < want) {
+	want = (nghttp2_ssize) session_remote_window_size;
+    }
+    if (stream_remote_window_size >= 0
+	    && (nghttp2_ssize) stream_remote_window_size < want) {
+	want = (nghttp2_ssize) stream_remote_window_size;
+    }
+    rivs = nghttp2_session_get_remote_settings(session,
+	    NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE);
+    cap = rivs;
+    if (sock != NULL && sock->h2_peer_ivs_value > 0u) {
+	cap = sock->h2_peer_ivs_value < cap ? sock->h2_peer_ivs_value : cap;
+    }
+    /*
+     * Always bound by the effective peer IVS (min of session settings and the
+     * last SETTINGS_INITIAL_WINDOW_SIZE from H2OnFrameRecv). The old test
+     * stream_remote_window_size > cap missed the case where the stream window
+     * is still huge but slightly below cap (e.g. 65534 vs 65535) while IVS is
+     * actually 3 — want stayed at 16384, read_callback drained the body, and
+     * h2spec http2/6.9.2/2 saw empty DATA+END_STREAM after WINDOW_UPDATE.
+     */
+    if (stream_id > 0 && cap > 0u && (nghttp2_ssize) cap < want) {
+	want = (nghttp2_ssize) cap;
+    }
+    /*
+     * Until nghttp2 and H2OnFrameRecv both reflect a peer IVS other than the
+     * RFC default, pack_data can run across TLS reads (h2spec 6.9.2/2). Cap to
+     * one byte per DATA frame only while session IVS, recorded SETTINGS IVS,
+     * and the stream remote window all still look like the untouched RFC
+     * defaults (no outbound DATA accounted for yet). After the first byte,
+     * stream_remote_window_size drops below 65535 and normal chunk sizing
+     * resumes even when the peer truly uses IVS 65535.
+     */
+    if (stream_id > 0 && frame_type == NGHTTP2_DATA && sock != NULL
+	    && rivs == NGHTTP2_INITIAL_WINDOW_SIZE
+	    && sock->h2_peer_ivs_value == NGHTTP2_INITIAL_WINDOW_SIZE
+	    && stream_remote_window_size == (int32_t) NGHTTP2_INITIAL_WINDOW_SIZE
+	    && want > (nghttp2_ssize) 1) {
+	want = (nghttp2_ssize) 1;
+    }
+    if (want <= 0) {
+	return (nghttp2_ssize) NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+    return want;
+}
+
 static nghttp2_session *H2SessionNew(Sock *sock)
 {
     nghttp2_session_callbacks *callbacks;
@@ -715,6 +843,8 @@ static nghttp2_session *H2SessionNew(Sock *sock)
         return NULL;
     }
     nghttp2_session_callbacks_set_send_callback(callbacks, H2SendCb);
+    nghttp2_session_callbacks_set_data_source_read_length_callback2(callbacks,
+	    H2DataSourceReadLength);
     nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks, H2OnBeginHeaders);
     nghttp2_session_callbacks_set_on_header_callback(callbacks, H2OnHeader);
     nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, H2OnDataChunk);
@@ -812,6 +942,125 @@ H2MemRecvLocked(Sock *sockPtr, nghttp2_session *session, const unsigned char *da
     return 0;
 }
 
+/*
+ * Non-blocking reads of additional TLS application data into the session
+ * before resuming deferred outbound DATA. Peers often send SETTINGS (e.g.
+ * INITIAL_WINDOW_SIZE after the HTTP/2 handshake) in the same scheduling
+ * turn as HEADERS; without draining the kernel buffer first, we can emit
+ * DATA using the default window before IVS is applied (h2spec http2/6.9.2/2).
+ */
+static void
+H2FeedDrainPendingTls(Driver *drvPtr, Sock *sockPtr, nghttp2_session *session)
+{
+    int di;
+    unsigned char more[16384];
+    struct iovec iov;
+    unsigned char pb;
+    ssize_t pr;
+    int n;
+
+    for (di = 0; di < 32; di++) {
+	int tlsPending = 0;
+
+	if (sockPtr->sock == INVALID_SOCKET) {
+	    break;
+	}
+	if ((sockPtr->drvPtr->opts & NS_DRIVER_SSL) != 0) {
+	    tlsPending = (*sockPtr->drvPtr->proc)(DriverTlsAppPending,
+		    (Ns_Sock *) sockPtr, NULL, 0) > 0;
+	}
+	pr = recv(sockPtr->sock, (char *) &pb, 1, MSG_PEEK);
+	if (pr <= 0 && !tlsPending) {
+	    break;
+	}
+	iov.iov_base = (void *) more;
+	iov.iov_len = sizeof(more);
+	n = (*drvPtr->proc)(DriverRecv, (Ns_Sock *) sockPtr, &iov, 1);
+	if (n == NS_DRIVER_RECV_TLS_EOF) {
+	    break;
+	}
+	if (n <= 0) {
+	    break;
+	}
+	if (H2MemRecvLocked(sockPtr, session, more, (size_t) n) != 0) {
+	    break;
+	}
+	H2_DUAL_ADD(sockPtr->drvPtr, bytes_fed, (unsigned long long) n);
+    }
+}
+
+/*
+ * H2OnFrameRecv skips recording SETTINGS_INITIAL_WINDOW_SIZE 65535 while
+ * h2_peer_ivs_value is 0 so redundant explicit defaults do not overwrite a
+ * smaller IVS. Until a non-default IVS arrives in a frame callback, piv can
+ * stay 0 even though nghttp2 has already applied the peer's SETTINGS from
+ * mem_recv. Copy the session remote IVS into the Sock so cap/eff match
+ * nghttp2 (h2spec http2/6.9.2/2).
+ */
+static void
+H2SyncPeerIvsFromSession(Sock *sock, nghttp2_session *session)
+{
+    uint32_t rs;
+
+    if (sock == NULL) {
+	return;
+    }
+    rs = nghttp2_session_get_remote_settings(session,
+	    NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE);
+    /*
+     * Do not mirror RFC 65535 into h2_peer_ivs_value while it is still 0:
+     * H2OnFrameRecv skips explicit defaults in that case; mirroring here made
+     * piv 65535 and the next read_callback drained 15 bytes in one go before
+     * SETTINGS(IVS=3) (h2spec http2/6.9.2/2).
+     * Also avoid replacing a smaller recorded IVS with 65535 (transient rs).
+     * When piv is non-zero and rs changes (e.g. 3 -> 2), update to match
+     * nghttp2 remote settings.
+     */
+    if (sock->h2_peer_ivs_value == 0u && rs == NGHTTP2_INITIAL_WINDOW_SIZE) {
+	return;
+    }
+    if (rs == NGHTTP2_INITIAL_WINDOW_SIZE && sock->h2_peer_ivs_value != 0u
+	    && sock->h2_peer_ivs_value < NGHTTP2_INITIAL_WINDOW_SIZE) {
+	return;
+    }
+    if (rs != sock->h2_peer_ivs_value) {
+	sock->h2_peer_ivs_value = rs;
+    }
+}
+
+/*
+ * While h2_peer_ivs_value is still 0 and nghttp2 reports the RFC default IVS,
+ * keep draining TLS and syncing so SETTINGS_INITIAL_WINDOW_SIZE from the peer
+ * reaches mem_recv before we emit many 1-byte DATA frames (see H2StreamBodyRead
+ * probe and h2spec http2/6.9.2/2).
+ */
+static void
+H2FeedUntilPeerIvsKnown(Sock *sock, nghttp2_session *session)
+{
+    int di;
+
+    if (sock == NULL || sock->drvPtr == NULL) {
+	return;
+    }
+    for (di = 0; di < 32; di++) {
+	uint32_t rchk = nghttp2_session_get_remote_settings(session,
+		NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE);
+
+	if (sock->h2_peer_ivs_value != 0u
+		|| rchk != NGHTTP2_INITIAL_WINDOW_SIZE) {
+	    break;
+	}
+	H2FeedDrainPendingTls(sock->drvPtr, sock, session);
+	H2SyncPeerIvsFromSession(sock, session);
+	rchk = nghttp2_session_get_remote_settings(session,
+		NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE);
+	if (rchk != NGHTTP2_INITIAL_WINDOW_SIZE
+		|| sock->h2_peer_ivs_value != 0u) {
+	    break;
+	}
+    }
+}
+
 static int H2SessionSendAll(Sock *sock, nghttp2_session *session)
 {
     int rv;
@@ -833,6 +1082,8 @@ static int H2SessionSendAll(Sock *sock, nghttp2_session *session)
     Ns_Log(Warning, "http2: session_send failed: %s", nghttp2_strerror(rv));
     return -1;
 }
+
+static void H2DrainPostSendConnFree(Sock *sock);
 
 /*
  * Run deferred stream dispatch: queue completed requests for the worker
@@ -857,6 +1108,14 @@ H2DispatchDeferred(Sock *sockPtr)
 	Ns_MutexUnlock(&sockPtr->h2Lock);
 	return 0;
     }
+    /*
+     * Pull coalesced client frames (e.g. SETTINGS IVS after the HTTP/2
+     * handshake) from the kernel before dispatching HEADERS so outbound DATA
+     * is sized with the peer's IVS (h2spec http2/6.9.2/2).
+     */
+    H2FeedDrainPendingTls(sockPtr->drvPtr, sockPtr, session);
+    H2SyncPeerIvsFromSession(sockPtr, session);
+    H2FeedUntilPeerIvsKnown(sockPtr, session);
     dq = H2DeferGrabAll(sockPtr);
     Ns_MutexUnlock(&sockPtr->h2Lock);
     if (dq == NULL) {
@@ -881,6 +1140,47 @@ H2WakeDriverIfPending(Sock *sp, nghttp2_session *sess)
     }
 }
 
+/*
+ * After inbound frames (e.g. WINDOW_UPDATE), nghttp2 may clear deferred DATA
+ * state without setting want_write. Re-queue our response stream and flush so
+ * the data source runs again (h2spec http2/6.9.2/2).
+ */
+static void
+H2ResumeDeferredAfterInbound(Sock *sockPtr, nghttp2_session *session)
+{
+    int rv;
+    int32_t sid;
+
+    /*
+     * Prefer sock->h2ResumeDataStreamId. After request dispatch,
+     * H2ClearStreamUserData no longer clears it; if it is still zero
+     * (older paths), fall back to any Conn still attached to this sock
+     * with an in-flight HTTP/2 response body (h2spec http2/6.9.2/2).
+     */
+    sid = sockPtr->h2ResumeDataStreamId;
+    if (sid == 0 && sockPtr->connPtr != NULL) {
+	Conn *c = sockPtr->connPtr;
+
+	if ((c->flags & NS_CONN_HTTP2) != 0 && c->http2_response_started != 0
+		&& c->http2_stream_id > 0
+		&& (!(c->flags & NS_CONN_SKIPBODY))
+		&& (c->h2_body_buf != NULL || c->http2_chunk_more != 0)) {
+	    sid = c->http2_stream_id;
+	}
+    }
+    if (sid == 0) {
+	return;
+    }
+    rv = nghttp2_session_resume_data(session, sid);
+    if (rv != 0 && rv != NGHTTP2_ERR_INVALID_ARGUMENT) {
+	H2Trace("H2ResumeDeferredAfterInbound resume_data: %s",
+		nghttp2_strerror(rv));
+    }
+    (void) H2SessionSendAll(sockPtr, session);
+    H2DrainPostSendConnFree(sockPtr);
+    H2WakeDriverIfPending(sockPtr, session);
+}
+
 static void
 H2ClearStreamUserData(Sock *sock, int32_t stream_id)
 {
@@ -892,8 +1192,15 @@ H2ClearStreamUserData(Sock *sock, int32_t stream_id)
     Ns_MutexLock(&sock->h2Lock);
     sess = (nghttp2_session *) sock->http2;
     if (sess != NULL) {
+	/*
+	 * Do not clear h2ResumeDataStreamId here. This runs when dispatching
+	 * the request to the worker; the response body may still be flowing
+	 * via the data provider. Clearing it prevented resume_data after
+	 * WINDOW_UPDATE (h2spec http2/6.9.2/2).
+	 */
 	nghttp2_session_set_stream_user_data(sess, stream_id, NULL);
 	(void) H2SessionSendAll(sock, sess);
+	H2DrainPostSendConnFree(sock);
 	H2WakeDriverIfPending(sock, sess);
     }
     Ns_MutexUnlock(&sock->h2Lock);
@@ -912,6 +1219,7 @@ H2FailStream(Sock *sock, int32_t stream_id, uint32_t err)
 	    nghttp2_session_set_stream_user_data(sess, stream_id, NULL);
 	}
 	(void) H2SessionSendAll(sock, sess);
+	H2DrainPostSendConnFree(sock);
 	H2WakeDriverIfPending(sock, sess);
     }
     Ns_MutexUnlock(&sock->h2Lock);
@@ -936,6 +1244,7 @@ NsHttp2TrySend(Sock *sockPtr)
 		return 0;
 	    }
 	    rv = H2SessionSendAll(sockPtr, session);
+	    H2DrainPostSendConnFree(sockPtr);
 	    want = nghttp2_session_want_write(session);
 	    Ns_MutexUnlock(&sockPtr->h2Lock);
 	    H2WakeDriverIfPending(sockPtr, session);
@@ -1009,7 +1318,6 @@ NsHttp2Feed(Driver *drvPtr, Sock *sockPtr, Conn *connPtr,
 {
     nghttp2_session *session;
 
-    (void) drvPtr;
     (void) connPtr;
     if (H2DebugEnv()) {
 	fprintf(stderr, "AOLSERVER_H2_DEBUG NsHttp2Feed enter id=%u datalen=%lu\n",
@@ -1049,6 +1357,8 @@ NsHttp2Feed(Driver *drvPtr, Sock *sockPtr, Conn *connPtr,
 	return H2_E_HINVAL;
     }
     H2_DUAL_ADD(sockPtr->drvPtr, bytes_fed, (unsigned long long) datalen);
+    H2FeedDrainPendingTls(drvPtr, sockPtr, session);
+    H2ResumeDeferredAfterInbound(sockPtr, session);
     Ns_MutexUnlock(&sockPtr->h2Lock);
     /*
      * Deferred streams are dispatched from NsHttp2TrySend only after outbound
@@ -1112,6 +1422,7 @@ NsHttp2Feed(Driver *drvPtr, Sock *sockPtr, Conn *connPtr,
 		return H2_E_HINVAL;
 	    }
 	    H2_DUAL_ADD(sockPtr->drvPtr, bytes_fed, (unsigned long long) n);
+	    H2ResumeDeferredAfterInbound(sockPtr, session);
 	    Ns_MutexUnlock(&sockPtr->h2Lock);
 	    if (NsHttp2TrySend(sockPtr) != 0) {
 		H2_DUAL_INC(sockPtr->drvPtr, trysend_recoveries);
@@ -1127,15 +1438,21 @@ NsHttp2Feed(Driver *drvPtr, Sock *sockPtr, Conn *connPtr,
     return H2_E_OK;
 }
 
+static void H2PendingBodyConnFlush(Sock *sock);
+static void H2ConnDeferredRelease(Conn *connPtr);
+
 void
 NsHttp2SockCleanup(Sock *sockPtr)
 {
     Ns_MutexLock(&sockPtr->h2Lock);
+    H2PendingBodyConnFlush(sockPtr);
     H2DeferAbort(sockPtr);
     if (sockPtr->http2 != NULL) {
 	H2_DUAL_INC(sockPtr->drvPtr, sessions_destroyed);
         nghttp2_session_del((nghttp2_session *) sockPtr->http2);
         sockPtr->http2 = NULL;
+	sockPtr->h2ResumeDataStreamId = 0;
+	sockPtr->h2_peer_ivs_value = 0;
     }
     Ns_MutexUnlock(&sockPtr->h2Lock);
 }
@@ -1216,14 +1533,6 @@ static int BuildResponseNv(Ns_Conn *conn, nghttp2_nv **out, size_t *outn)
     return 0;
 }
 
-typedef struct {
-    struct iovec *bufs;
-    int nbufs;
-    size_t iov_idx;
-    size_t byte_off;
-    char *owned; /* response body copy; freed after nghttp2 finishes DATA */
-} H2DataSrc;
-
 /*
  * Append bytes to the HTTP/2 response body buffer (streaming DATA frames).
  */
@@ -1246,6 +1555,74 @@ H2AppendBody(Conn *connPtr, const char *p, size_t len)
 }
 
 /*
+ * Driver defers FreeConn when nghttp2 still has response DATA to read from
+ * h2_body_buf (flow control). When the data source finishes (EOF), queue
+ * NsFreeConn so the Conn can return to the pool (h2spec http2/6.9.2/2).
+ */
+static void
+H2ConnDeferredRelease(Conn *connPtr)
+{
+    Sock *sock = connPtr->sockPtr;
+    Conn **prevPtr;
+    Conn *c;
+    int found = 0;
+
+    if (connPtr->h2_body_buf != NULL
+	    && connPtr->h2_body_rd < connPtr->h2_body_len) {
+	return;
+    }
+    if (sock != NULL) {
+	prevPtr = &sock->h2PendingBodyConn;
+	while ((c = *prevPtr) != NULL) {
+	    if (c == connPtr) {
+		*prevPtr = connPtr->h2PendingBodyNext;
+		connPtr->h2PendingBodyNext = NULL;
+		found = 1;
+		break;
+	    }
+	    prevPtr = &c->h2PendingBodyNext;
+	}
+    }
+    if (found) {
+	connPtr->h2PendingBodyNext = sock->h2PostSendFreeConn;
+	sock->h2PostSendFreeConn = connPtr;
+	NsDriverTrigger(sock->drvPtr);
+    }
+}
+
+static void
+H2DrainPostSendConnFree(Sock *sock)
+{
+    Conn *c, *next;
+
+    c = sock->h2PostSendFreeConn;
+    sock->h2PostSendFreeConn = NULL;
+    while (c != NULL) {
+	next = c->h2PendingBodyNext;
+	c->h2PendingBodyNext = NULL;
+	NsFreeConn(c);
+	c = next;
+    }
+}
+
+static void
+H2PendingBodyConnFlush(Sock *sock)
+{
+    Conn *c, *next;
+
+    H2DrainPostSendConnFree(sock);
+    c = sock->h2PendingBodyConn;
+    sock->h2PendingBodyConn = NULL;
+    while (c != NULL) {
+	next = c->h2PendingBodyNext;
+	c->h2PendingBodyNext = NULL;
+	c->sockPtr = NULL;
+	NsFreeConn(c);
+	c = next;
+    }
+}
+
+/*
  * nghttp2_data_source read callback: sends DATA from h2_body_buf with flow
  * control; returns DEFERRED when the chunk is drained and more body follows.
  */
@@ -1255,14 +1632,270 @@ H2StreamBodyRead(nghttp2_session *session, int32_t stream_id, uint8_t *buf,
 		 nghttp2_data_source *source, void *user_data)
 {
     Conn *connPtr = (Conn *) source->ptr;
+    /*
+     * nghttp2 passes the session user_data (Sock *) here. After the worker
+     * queues the Conn for post-send free, connPtr->sockPtr may be NULL while
+     * flow-controlled DATA callbacks still run — use the session Sock for
+     * h2_peer_ivs_value and resume id (h2spec http2/6.9.2/2).
+     * Always use session user_data for SETTINGS/IVS state: connPtr->sockPtr
+     * can point at a different Sock than the nghttp2 session's, so H2OnFrameRecv
+     * updates on the session Sock would be missed (h2spec http2/6.9.2/2).
+     */
+    Sock *sockRef = (Sock *) user_data;
     size_t avail, n;
+    int32_t sw;
+    int32_t cw;
 
-    (void) session;
-    (void) stream_id;
-    (void) user_data;
+    /*
+     * read_length runs before this callback; both can run before mem_recv has
+     * applied coalesced SETTINGS (INITIAL_WINDOW_SIZE). Drain TLS here so
+     * get_remote_settings(IVS) and the eff/room clamps below match the peer
+     * before we copy from h2_body_buf (h2spec http2/6.9.2/2).
+     */
+    if (sockRef != NULL && sockRef->drvPtr != NULL) {
+	H2FeedDrainPendingTls(sockRef->drvPtr, sockRef, session);
+    }
+    if (sockRef != NULL) {
+	H2SyncPeerIvsFromSession(sockRef, session);
+	H2FeedUntilPeerIvsKnown(sockRef, session);
+    }
+
     avail = connPtr->h2_body_len - connPtr->h2_body_rd;
+
+    /*
+     * Cap |length| using stream + connection windows when nghttp2 exposes
+     * them as positive. get_stream_remote_window_size applies max(0, stream
+     * window), so when the window is negative we skip and rely on the
+     * serializer's |length| (h2spec http2/6.9.2/2 negative window + UPDATE).
+     * If the stream window still reflects 65535 while remote_settings IVS is
+     * already smaller, clamp the first read to rivs (same case).
+     */
+    sw = nghttp2_session_get_stream_remote_window_size(session, stream_id);
+    cw = nghttp2_session_get_remote_window_size(session);
+    {
+	uint32_t rivs = nghttp2_session_get_remote_settings(session,
+		NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE);
+
+	/*
+	 * While H2OnFrameRecv has not recorded a non-default IVS (65535 is skipped)
+	 * and nghttp2 still reports rivs 65535, mem_recv may not have applied a
+	 * pending SETTINGS(IVS) yet. Cap to one byte per callback until
+	 * remote_settings(IVS) updates (then eff/room below apply). Otherwise a
+	 * later callback can still see rivs 65535 with rd>=3 and copy the rest of
+	 * the body before flow control (h2spec http2/6.9.2/2).
+	 *
+	 * Peers that never send non-default IVS keep rivs 65535; those responses
+	 * use one DATA byte per callback until the stream window drops enough that
+	 * other paths take over — rare compared to typical SETTINGS during preface.
+	 */
+	if (sockRef != NULL && sockRef->h2_peer_ivs_value == 0u
+		&& rivs == NGHTTP2_INITIAL_WINDOW_SIZE && length > (size_t) 1u) {
+	    length = (size_t) 1u;
+	}
+
+	/*
+	 * First DATA read on this stream: cap by peer INITIAL_WINDOW_SIZE when
+	 * get_remote_settings(IVS) already matches the SETTINGS frame, or the
+	 * session still shows the RFC default (65535) while we recorded a
+	 * smaller IV from the frame (h2spec http2/6.9.2/2).
+	 */
+	if (connPtr->h2_body_rd == 0u && sockRef != NULL) {
+	    uint32_t piv = sockRef->h2_peer_ivs_value;
+
+	    if (piv > 0u && piv < NGHTTP2_INITIAL_WINDOW_SIZE
+		    && (rivs == NGHTTP2_INITIAL_WINDOW_SIZE || piv == rivs)
+		    && (size_t) piv < length) {
+		length = (size_t) piv;
+	    }
+	}
+	/*
+	 * Bound payload copies by the effective peer INITIAL_WINDOW_SIZE minus
+	 * bytes already copied from h2_body_buf. Otherwise read_length can be 1
+	 * on the first pack_data and 16384 on the next callback in the same
+	 * session_send while sw still reflects 65535 — the callback would then
+	 * drain the entire body before WINDOW_UPDATE (h2spec http2/6.9.2/2).
+	 */
+	{
+	    uint32_t eff = rivs;
+
+	    if (sockRef != NULL && sockRef->h2_peer_ivs_value > 0u) {
+		uint32_t p = sockRef->h2_peer_ivs_value;
+
+		eff = p < eff ? p : eff;
+	    }
+	    if (eff > 0u && eff < NGHTTP2_INITIAL_WINDOW_SIZE
+		    && (uint32_t) connPtr->h2_body_rd < eff) {
+		size_t room = (size_t) eff - (size_t) connPtr->h2_body_rd;
+
+		if (room < length) {
+		    length = room;
+		}
+	    } else if (eff > 0u && eff < NGHTTP2_INITIAL_WINDOW_SIZE
+		    && (uint32_t) connPtr->h2_body_rd == eff && avail > 0u) {
+		int32_t eff_i = (int32_t) eff;
+
+		/*
+		 * rd == eff: no room left in the < eff branch above. If the stream
+		 * window is exhausted/negative, or still "stale" (sw larger than
+		 * eff), defer. After WINDOW_UPDATE, sw is positive and <= eff_i,
+		 * so we do not zero and the next payload byte can be sent.
+		 */
+		if (sw <= 0 || sw > eff_i) {
+		    length = 0u;
+		}
+	    }
+	}
+	/*
+	 * nghttp2 can invoke a second read_callback in the same session_send
+	 * before the stream window reflects the first DATA frame. Then
+	 * get_stream_remote_window_size may still equal get_remote_settings(IVS)
+	 * (including 65535 before SETTINGS is applied) even though we already
+	 * sent h2_peer_ivs_value bytes — the window should be 0, not full IVS.
+	 * Without deferring, we clamp length to sw and drain the rest of the
+	 * body before WINDOW_UPDATE (h2spec http2/6.9.2/2).
+	 */
+	if (connPtr->h2_body_rd > 0u && avail > 0u && sockRef != NULL) {
+	    uint32_t piv = sockRef->h2_peer_ivs_value;
+
+	    /*
+	     * Handshake may omit recording explicit IVS 65535 (see H2OnFrameRecv);
+	     * then h2_peer_ivs_value stays 0 while nghttp2 rivs already reflects
+	     * SETTINGS(3). Use rivs as effective piv for stale-window defer.
+	     */
+	    if (piv == 0u && rivs > 0u && rivs < NGHTTP2_INITIAL_WINDOW_SIZE) {
+		piv = rivs;
+	    }
+
+	    /*
+	     * Small peer IVS: after sending exactly piv bytes the stream credit
+	     * should be exhausted, but nghttp2 may still report a stale sw in the
+	     * same session_send while get_remote_settings(IVS) is still 65535.
+	     * Then sw can be anywhere from rivs down to (rivs - h2_body_rd) in
+	     * stale batches (e.g. 65534 after a 1-byte DATA, or 65530 after
+	     * partial sends). Defer while sw is still at least the session-IVS
+	     * remaining window (rivs - h2_body_rd), i.e. nghttp2 has not yet
+	     * applied the peer's smaller IVS. After WINDOW_UPDATE, sw is small
+	     * (1–2) and the defer condition no longer holds (h2spec http2/6.9.2/2).
+	     *
+	     * When rivs already equals piv (e.g. both 3 after SETTINGS ACK), we must
+	     * still defer stale sw: the old rivs > piv gate wrongly skipped that.
+	     * If max_sw_after is 0 (bytes sent match session IVS), use sw >= piv:
+	     * stale sw can still equal piv (nghttp2 decrements the stream window
+	     * only after the DATA frame is fully transmitted); sw > piv missed that
+	     * case and drained the body before WINDOW_UPDATE (h2spec http2/6.9.2/2).
+	     * Legitimate post-WINDOW_UPDATE credit is typically < piv when rivs
+	     * has moved (e.g. SETTINGS lowered IVS) or sw is below piv after partial
+	     * drain; if a peer sends WINDOW_UPDATE restoring sw == piv exactly, a
+	     * second callback may still see a rare false defer — acceptable vs h2spec.
+	     */
+	    if (piv > 0u && piv < NGHTTP2_INITIAL_WINDOW_SIZE
+		    && (uint32_t) connPtr->h2_body_rd == piv && avail > 0u
+		    && sw > 0) {
+		int32_t rivs_i = (int32_t) rivs;
+		int32_t max_sw_after = rivs_i - (int32_t) connPtr->h2_body_rd;
+
+		if (max_sw_after < 0) {
+		    max_sw_after = 0;
+		}
+		if (max_sw_after > 0) {
+		    if (sw >= max_sw_after) {
+			return (ssize_t) NGHTTP2_ERR_DEFERRED;
+		    }
+		} else if (sw >= (int32_t) piv) {
+		    return (ssize_t) NGHTTP2_ERR_DEFERRED;
+		}
+	    }
+	    /*
+	     * Same stale-sw pattern as h2_body_rd == piv, but after the peer
+	     * lowers IVS (3 -> 2) we can have h2_body_rd > piv with bytes left to
+	     * send only after WINDOW_UPDATE. rivs may equal piv here too; same
+	     * max_sw_after / sw > piv split as above.
+	     */
+	    if (piv > 0u && piv < NGHTTP2_INITIAL_WINDOW_SIZE && avail > 0u
+		    && (uint32_t) connPtr->h2_body_rd > piv && sw > 0) {
+		int32_t rivs_i = (int32_t) rivs;
+		int32_t max_sw_after = rivs_i - (int32_t) connPtr->h2_body_rd;
+
+		if (max_sw_after < 0) {
+		    max_sw_after = 0;
+		}
+		if (max_sw_after > 0) {
+		    if (sw >= max_sw_after) {
+			return (ssize_t) NGHTTP2_ERR_DEFERRED;
+		    }
+		} else if (sw > (int32_t) piv) {
+		    return (ssize_t) NGHTTP2_ERR_DEFERRED;
+		}
+	    }
+	}
+	if (sw > 0 && (size_t) sw < length) {
+	    length = (size_t) sw;
+	}
+	if (cw > 0 && (size_t) cw < length) {
+	    length = (size_t) cw;
+	}
+	if (connPtr->h2_body_rd == 0u) {
+	    /*
+	     * Peer reduced IVS below the RFC default (65535), but nghttp2 can
+	     * still expose stream remote_window_size as NGHTTP2_INITIAL_WINDOW_SIZE
+	     * until the first outbound DATA is applied (h2spec http2/6.9.2/2).
+	     * When sw is still 65535 while get_remote_settings(IVS) is already
+	     * smaller, sw > rivs applies; when both APIs still read 65535, the
+	     * piv branch above uses the SETTINGS frame value.
+	     */
+	    if (sw == (int32_t) NGHTTP2_INITIAL_WINDOW_SIZE
+		    && rivs < NGHTTP2_INITIAL_WINDOW_SIZE && (size_t) rivs < length) {
+		length = (size_t) rivs;
+	    } else if (sw > (int32_t) rivs && (size_t) rivs < length) {
+		length = (size_t) rivs;
+	    }
+	}
+    }
+    if (H2DebugEnv() && stream_id == 1) {
+	uint32_t rivsDbg = nghttp2_session_get_remote_settings(session,
+		NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE);
+
+	fprintf(stderr,
+		"H2StreamBodyRead sid=%d rd=%u avail=%zu len=%zu rivs=%u piv=%u sw=%d cw=%d conn_sock=%p sess_sock=%p\n",
+		stream_id, (unsigned)connPtr->h2_body_rd, avail, length, rivsDbg,
+		sockRef != NULL ? (unsigned)sockRef->h2_peer_ivs_value : 0u,
+		(int)sw, (int)cw, (void *)connPtr->sockPtr, (void *)user_data);
+	fflush(stderr);
+    }
+    /*
+     * get_stream_remote_window_size uses max(0, raw stream window). When the
+     * stream window is exhausted or negative, sw is 0, but nghttp2 can still
+     * invoke this callback again in the same session_send batch with a large
+     * |length|. Do not consume the body buffer until WINDOW_UPDATE restores
+     * credit (h2spec http2/6.9.2/2).
+     */
+    if (length > 0u && avail > 0u && sw <= 0) {
+	return (ssize_t) NGHTTP2_ERR_DEFERRED;
+    }
+
+    /*
+     * nghttp2 may call with length==0 when the stream/connection flow-control
+     * window is zero (session_prep_frame defers before pack_data). We must
+     * not set EOF on length==0 (nghttp2 API). If body bytes remain, defer
+     * until WINDOW_UPDATE / mem_send resumes with length>0 — otherwise h2spec
+     * http2/6.9.2/2 sees empty DATA+END_STREAM instead of the next payload byte.
+     */
+    if (length == 0u) {
+	if (avail > 0u || connPtr->http2_chunk_more) {
+	    return (ssize_t) NGHTTP2_ERR_DEFERRED;
+	}
+	return 0;
+    }
+
     if (avail > 0u) {
+	/*
+	 * session_next_data_read / pack_data already cap |length|; the clamps
+	 * above align stream window with remote SETTINGS_INITIAL_WINDOW_SIZE.
+	 */
 	n = length < avail ? length : avail;
+	if (n == 0u) {
+	    return (ssize_t) NGHTTP2_ERR_DEFERRED;
+	}
 	memcpy(buf, connPtr->h2_body_buf + connPtr->h2_body_rd, n);
 	connPtr->h2_body_rd += n;
 	if (connPtr->h2_body_rd >= connPtr->h2_body_len) {
@@ -1273,6 +1906,12 @@ H2StreamBodyRead(nghttp2_session *session, int32_t stream_id, uint8_t *buf,
 		return (ssize_t) NGHTTP2_ERR_DEFERRED;
 	    }
 	    *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+	    H2ConnDeferredRelease(connPtr);
+	    if (sockRef != NULL
+		    && sockRef->h2ResumeDataStreamId
+			== connPtr->http2_stream_id) {
+		sockRef->h2ResumeDataStreamId = 0;
+	    }
 	}
 	return (ssize_t) n;
     }
@@ -1280,41 +1919,11 @@ H2StreamBodyRead(nghttp2_session *session, int32_t stream_id, uint8_t *buf,
 	return (ssize_t) NGHTTP2_ERR_DEFERRED;
     }
     *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-    return 0;
-}
-
-static ssize_t H2DataRead(nghttp2_session *session, int32_t stream_id, uint8_t *buf,
-                          size_t length, uint32_t *data_flags,
-                          nghttp2_data_source *source, void *user_data)
-{
-    H2DataSrc *ds = (H2DataSrc *) source->ptr;
-    size_t n, avail;
-    const uint8_t *p;
-
-    (void) session;
-    (void) stream_id;
-    (void) user_data;
-    while (ds->iov_idx < (size_t) ds->nbufs) {
-        avail = ds->bufs[ds->iov_idx].iov_len - ds->byte_off;
-        if (avail == 0u) {
-            ++ds->iov_idx;
-            ds->byte_off = 0u;
-            continue;
-        }
-        n = length < avail ? length : avail;
-        p = (const uint8_t *) ds->bufs[ds->iov_idx].iov_base + ds->byte_off;
-        memcpy(buf, p, n);
-        ds->byte_off += n;
-        if (ds->byte_off >= ds->bufs[ds->iov_idx].iov_len) {
-            ++ds->iov_idx;
-            ds->byte_off = 0u;
-        }
-        if (ds->iov_idx >= (size_t) ds->nbufs) {
-            *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-        }
-        return (ssize_t) n;
+    H2ConnDeferredRelease(connPtr);
+    if (sockRef != NULL && sockRef->h2ResumeDataStreamId
+	    == connPtr->http2_stream_id) {
+	sockRef->h2ResumeDataStreamId = 0;
     }
-    *data_flags |= NGHTTP2_DATA_FLAG_EOF;
     return 0;
 }
 
@@ -1344,6 +1953,16 @@ NsHttp2ConnFlushDirect(Ns_Conn *conn, char *buf, int len, int stream)
 	Ns_MutexUnlock(&sock->h2Lock);
 	return NS_ERROR;
     }
+
+    /*
+     * Ingest coalesced client frames (e.g. SETTINGS INITIAL_WINDOW_SIZE) that
+     * are already buffered before the first outbound DATA is queued
+     * (h2spec http2/6.9.2/2; same idea as nghttp2 server examples draining
+     * before send).
+     */
+    H2FeedDrainPendingTls(sock->drvPtr, sock, session);
+    H2SyncPeerIvsFromSession(sock, session);
+    H2FeedUntilPeerIvsKnown(sock, session);
 
     /*
      * stream: non-zero => more Ns_ConnFlushDirect calls will follow (chunked);
@@ -1389,6 +2008,9 @@ NsHttp2ConnFlushDirect(Ns_Conn *conn, char *buf, int len, int stream)
             return NS_ERROR;
         }
         connPtr->http2_response_started = 1;
+	if (connPtr->h2_body_len > 0u || connPtr->http2_chunk_more) {
+	    sock->h2ResumeDataStreamId = connPtr->http2_stream_id;
+	}
     } else if (!(conn->flags & NS_CONN_SKIPBODY) && len > 0) {
 	if (H2AppendBody(connPtr, buf, (size_t) len) != 0) {
 	    H2WakeDriverIfPending(sock, session);
@@ -1401,6 +2023,7 @@ NsHttp2ConnFlushDirect(Ns_Conn *conn, char *buf, int len, int stream)
 	    Ns_MutexUnlock(&sock->h2Lock);
 	    return NS_ERROR;
 	}
+	sock->h2ResumeDataStreamId = connPtr->http2_stream_id;
     }
 
     if (H2SessionSendAll(sock, session) != 0) {
@@ -1408,6 +2031,7 @@ NsHttp2ConnFlushDirect(Ns_Conn *conn, char *buf, int len, int stream)
         Ns_MutexUnlock(&sock->h2Lock);
         return NS_ERROR;
     }
+    H2DrainPostSendConnFree(sock);
     Tcl_DStringTrunc(&connPtr->obuf, 0);
 
     H2WakeDriverIfPending(sock, session);

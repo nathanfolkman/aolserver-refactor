@@ -1258,7 +1258,34 @@ DriverThread(void *arg)
 	     * Add the Sock to the gracefull close list if still open.
 	     */
 
-    	    if ((sockPtr = connPtr->sockPtr) != NULL) {
+	    sockPtr = connPtr->sockPtr;
+#if HAVE_NGHTTP2
+	    /*
+	     * nghttp2 may still read response DATA from h2_body_buf after the
+	     * worker returns (flow control deferred DATA). Defer FreeConn until
+	     * H2StreamBodyRead finishes (h2spec http2/6.9.2/2).
+	     */
+	    if ((connPtr->flags & NS_CONN_HTTP2) != 0
+		    && sockPtr != NULL
+		    && connPtr->h2_body_buf != NULL
+		    && connPtr->h2_body_rd < connPtr->h2_body_len) {
+		connPtr->h2PendingBodyNext = sockPtr->h2PendingBodyConn;
+		sockPtr->h2PendingBodyConn = connPtr;
+		continue;
+	    }
+	    /*
+	     * Ns_ConnClose was skipped while response DATA was still pending (see
+	     * connio.c); run deferred socket keepalive / Tcl at-close now that the
+	     * buffer is drained or the Conn is being recycled for other reasons.
+	     */
+	    if ((connPtr->flags & NS_CONN_HTTP2) != 0
+		    && sockPtr != NULL
+		    && (connPtr->flags & NS_CONN_CLOSED) == 0) {
+		(void) Ns_ConnClose((Ns_Conn *) connPtr);
+		sockPtr = connPtr->sockPtr;
+	    }
+#endif
+    	    if (sockPtr != NULL) {
         	connPtr->sockPtr = NULL;
 		/*
 		 * HTTP/2 stream Conns borrow the reader's TLS Sock; never
@@ -2005,7 +2032,11 @@ SockAccept(SOCKET lsock, Driver *drvPtr)
     sockPtr->connPtr = NULL;
     sockPtr->app_protocol = NS_APP_PROTO_UNKNOWN;
     sockPtr->http2 = NULL;
+    sockPtr->h2ResumeDataStreamId = 0;
+    sockPtr->h2PendingBodyConn = NULL;
+    sockPtr->h2PostSendFreeConn = NULL;
     sockPtr->h2NeedDriverPoll = 0;
+    sockPtr->h2_peer_ivs_value = 0;
     sockPtr->h2DeferFirst = sockPtr->h2DeferLast = NULL;
 
     /*

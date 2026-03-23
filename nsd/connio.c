@@ -92,7 +92,23 @@ Ns_ConnClose(Ns_Conn *conn)
 {
     Conn             *connPtr = (Conn *)conn;
     int		      keep;
-    
+
+#if HAVE_NGHTTP2
+    /*
+     * HTTP/2: keep the Sock pointer until nghttp2 has finished reading the
+     * response body from h2_body_buf. The worker returns while DATA may still
+     * be flow-controlled; driver.c defers FreeConn using sockPtr + partial
+     * buffer. Clearing sockPtr here first would skip that deferral and
+     * FreeConn would release h2_body_buf while H2StreamBodyRead still runs
+     * (h2spec http2/6.9.2/2).
+     */
+    if ((conn->flags & NS_CONN_HTTP2) != 0
+	    && connPtr->h2_body_buf != NULL
+	    && connPtr->h2_body_rd < connPtr->h2_body_len) {
+	return NS_OK;
+    }
+#endif
+
     if (connPtr->sockPtr != NULL) {
 	Ns_GetTime(&connPtr->times.close);
 	keep = (conn->flags & NS_CONN_KEEPALIVE) ? 1 : 0;

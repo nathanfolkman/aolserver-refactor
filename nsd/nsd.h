@@ -440,7 +440,11 @@ typedef struct Sock {
     struct Conn *connPtr;
     void *http2; /* nghttp2_session * when app_protocol is H2 */
     Ns_Mutex h2Lock; /* serializes nghttp2_session_* for this connection */
+    int32_t h2ResumeDataStreamId; /* response stream for resume_data after inbound WINDOW_UPDATE */
+    struct Conn *h2PendingBodyConn; /* Conns waiting for nghttp2 to finish reading response DATA */
+    struct Conn *h2PostSendFreeConn; /* NsFreeConn after session_send (not from read callback) */
     int h2NeedDriverPoll; /* TLS WANT_READ: return sock to driver instead of reader spin */
+    uint32_t h2_peer_ivs_value; /* last INITIAL_WINDOW_SIZE from peer SETTINGS (0 = none seen) */
     void *h2DeferFirst; /* H2Defer (http2.c): streams ready after full mem_recv */
     void *h2DeferLast;
     struct sockaddr_in sa;
@@ -588,6 +592,7 @@ typedef struct Conn {
     char *h2_body_buf;
     size_t h2_body_len;
     size_t h2_body_rd;
+    struct Conn *h2PendingBodyNext; /* next on Sock.h2PendingBodyConn while DATA deferred */
 #if HAVE_NGHTTP3
     void *h3_handler; /* NsH3Conn * */
     int64_t h3_stream_id;

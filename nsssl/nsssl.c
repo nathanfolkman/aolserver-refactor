@@ -38,12 +38,15 @@
 #include "nsconfig.h"
 #endif
 #include <errno.h>
+#include <dlfcn.h>
 #include <sys/socket.h>
 #include <openssl/ssl.h>
+#include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/x509.h>
 #include <poll.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define DRIVER_NAME "nsssl"
 
@@ -55,10 +58,41 @@
 typedef struct NsSslSockArg {
     SSL *ssl;
     Ns_Mutex lock;
+    /*
+     * Set after NsHttp2ReaderYieldFlush runs post-handshake (once per connection).
+     * Covers ALPN=h2 immediately and sniff-based H2 on the next DriverRecv.
+     */
+    int h2PostTlsHandshakeFlush;
+    /*
+     * When ALPN is unknown, the HTTP/2 connection preface may span multiple
+     * SSL_read buffers; accumulate up to four bytes to classify before
+     * defaulting to HTTP/1.1 (h2spec sequential connections).
+     */
+    unsigned char appPrefSniff[4];
+    int appPrefSniffLen;
 } NsSslSockArg;
 
 static Ns_Mutex sslInitLock;
 static int sslInitLockReady;
+
+/*
+ * Resolve NsHttp2ReaderYieldFlush at runtime so nsssl does not depend on the
+ * linker's choice of libnsd (same process already loaded libnsd from nsd).
+ */
+static void
+H2PostTlsHandshakeFlush(Ns_Sock *sock)
+{
+    static void (*fn)(void *);
+    static int tried;
+
+    if (!tried) {
+	tried = 1;
+	fn = (void (*)(void *)) dlsym(RTLD_DEFAULT, "NsHttp2ReaderYieldFlush");
+    }
+    if (fn != NULL) {
+	fn((void *) sock);
+    }
+}
 
 /*
  * ALPN preference: offer h2 and http/1.1 (length-prefixed protocol ids).
@@ -89,6 +123,45 @@ SslAlpnSelectCb(SSL *ssl, const unsigned char **out, unsigned char *outlen,
 
 static Ns_DriverProc SSLProc;
 static int SslAcceptNonBlocking(SSL *ssl, SOCKET fd);
+
+/*
+ * True if the TCP socket has ciphertext waiting (next TLS record).
+ * Combined with SSL_has_pending so one DriverRecv can decrypt multiple
+ * records when the HTTP/2 preface spans TLS records (h2spec back-to-back).
+ */
+static int
+SslTcpHasIncoming(SSL *ssl)
+{
+    int fd = SSL_get_fd(ssl);
+    unsigned char byte;
+
+    if (fd < 0) {
+	return 0;
+    }
+    return recv(fd, (char *) &byte, 1, MSG_PEEK) > 0;
+}
+
+/*
+ * True if buf[0..len-1] matches the RFC 7540 connection preface prefix.
+ * After TLS session resumption, ALPN may be unset and the first SSL_read can
+ * return fewer than four bytes; we must not treat a partial "PRI" as HTTP/1.1.
+ */
+static int
+H2ConnPrefacePrefix(const unsigned char *buf, size_t len)
+{
+    static const char pref[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    size_t i;
+
+    if (len > sizeof(pref) - 1u) {
+	len = sizeof(pref) - 1u;
+    }
+    for (i = 0; i < len; i++) {
+	if (buf[i] != (unsigned char) pref[i]) {
+	    return 0;
+	}
+    }
+    return 1;
+}
 
 /*
  * Lazily create the SSL connection (under sslInitLock) and return the
@@ -160,9 +233,35 @@ SslEnsureConn(Ns_Sock *sock, Ns_Driver *driver)
 	SSL_get0_alpn_selected(ssl, &p, &pl);
 	if (pl == 2u && p != NULL && p[0] == 'h' && p[1] == '2') {
 	    sock->app_protocol = NS_APP_PROTO_H2;
-	} else {
+	} else if (pl == 8u && p != NULL && memcmp(p, "http/1.1", 8) == 0) {
 	    sock->app_protocol = NS_APP_PROTO_HTTP11;
+	} else {
+	    /*
+	     * TLS 1.3 resumption: some stacks (e.g. Go h2spec after a prior case)
+	     * leave ALPN empty on the SSL object even though the session
+	     * negotiated h2. Without H2, SockReadLine skips NsHttp2EnsureSession
+	     * on the first n==0 read and the peer stalls (generic/2/2 then
+	     * generic/2/3).
+	     */
+	    SSL_SESSION *sess = SSL_get0_session(ssl);
+
+	    if (sess != NULL) {
+		const unsigned char *sp;
+		size_t slen;
+
+		SSL_SESSION_get0_alpn_selected(sess, &sp, &slen);
+		if (slen == 2u && sp != NULL && sp[0] == 'h' && sp[1] == '2') {
+		    sock->app_protocol = NS_APP_PROTO_H2;
+		} else if (slen == 8u && sp != NULL
+			&& memcmp(sp, "http/1.1", 8) == 0) {
+		    sock->app_protocol = NS_APP_PROTO_HTTP11;
+		}
+	    }
 	}
+	/*
+	 * If still UNKNOWN, classify using appPrefSniff across SSL_read chunks
+	 * in SSLProc (below).
+	 */
     }
     Ns_MutexUnlock(&sslInitLock);
     return sa;
@@ -376,9 +475,18 @@ SSLProc(Ns_DriverCmd cmd, Ns_Sock *sock, struct iovec *bufs, int nbufs)
 	if (sa == NULL) {
 	    return -1;
 	}
+	if (cmd == DriverRecv && sock->app_protocol == NS_APP_PROTO_H2
+		&& !sa->h2PostTlsHandshakeFlush) {
+	    H2PostTlsHandshakeFlush(sock);
+	    sa->h2PostTlsHandshakeFlush = 1;
+	}
 	ssl = sa->ssl;
 	Ns_MutexLock(&sa->lock);
 	total = 0;
+	{
+	    struct iovec *firstiov = bufs;
+	    int nbufs_in = nbufs;
+
 	do {
 	    if (cmd == DriverSend) {
 		n = SSL_write(ssl, bufs->iov_base, (int) bufs->iov_len);
@@ -412,7 +520,9 @@ SSLProc(Ns_DriverCmd cmd, Ns_Sock *sock, struct iovec *bufs, int nbufs)
 		    char *base = bufs->iov_base;
 		    int cap = (int) bufs->iov_len;
 
-		    while (total < cap && SSL_has_pending(ssl)) {
+		    while (total < cap
+			    && (SSL_has_pending(ssl) != 0
+				    || SslTcpHasIncoming(ssl) != 0)) {
 			int room = cap - total;
 			int pend = SSL_pending(ssl);
 
@@ -508,6 +618,41 @@ SSLProc(Ns_DriverCmd cmd, Ns_Sock *sock, struct iovec *bufs, int nbufs)
 	    ++bufs;
 	} while (n > 0 && --nbufs > 0);
 	n = total;
+	if (cmd == DriverRecv && nbufs_in == 1 && n > 0
+		&& sock->app_protocol != NS_APP_PROTO_H2) {
+	    unsigned char *b = (unsigned char *) firstiov->iov_base;
+
+	    /*
+	     * RFC 7540 connection preface begins with "PRI * HTTP/2.0\r\n".
+	     * When ALPN was not available after handshake (session resume),
+	     * the preface may span multiple SSL_read buffers; accumulate up to
+	     * four bytes in appPrefSniff before defaulting to HTTP/1.1.
+	     */
+	    if (sock->app_protocol == NS_APP_PROTO_UNKNOWN) {
+		size_t bi;
+
+		for (bi = 0; bi < (size_t) n && sa->appPrefSniffLen < 4; bi++) {
+		    sa->appPrefSniff[sa->appPrefSniffLen++] = b[bi];
+		}
+		if (sa->appPrefSniffLen >= 4) {
+		    if (sa->appPrefSniff[0] == 'P' && sa->appPrefSniff[1] == 'R'
+			    && sa->appPrefSniff[2] == 'I'
+			    && sa->appPrefSniff[3] == ' ') {
+			sock->app_protocol = NS_APP_PROTO_H2;
+		    } else {
+			sock->app_protocol = NS_APP_PROTO_HTTP11;
+		    }
+		} else if (sa->appPrefSniffLen > 0
+			&& !H2ConnPrefacePrefix(sa->appPrefSniff,
+				(size_t) sa->appPrefSniffLen)) {
+		    sock->app_protocol = NS_APP_PROTO_HTTP11;
+		}
+	    } else if ((size_t) n >= 4u && b[0] == 'P' && b[1] == 'R'
+		    && b[2] == 'I' && b[3] == ' ') {
+		sock->app_protocol = NS_APP_PROTO_H2;
+	    }
+	}
+	}
 	Ns_MutexUnlock(&sa->lock);
 	break;
 
@@ -557,6 +702,28 @@ SSLProc(Ns_DriverCmd cmd, Ns_Sock *sock, struct iovec *bufs, int nbufs)
 	    if (ssl != NULL
 		    && (SSL_pending(ssl) > 0 || SSL_has_pending(ssl))) {
 		n = 1;
+	    }
+	    Ns_MutexUnlock(&sa->lock);
+	}
+	break;
+
+    case DriverTlsWantWrite:
+	sa = sock->arg;
+	n = 0;
+	if (sa != NULL) {
+	    Ns_MutexLock(&sa->lock);
+	    ssl = sa->ssl;
+	    if (ssl != NULL) {
+		if (SSL_want_write(ssl) != 0) {
+		    n = 1;
+		} else {
+		    BIO *wbio = SSL_get_wbio(ssl);
+
+		    if (wbio != NULL
+			    && BIO_ctrl(wbio, BIO_CTRL_WPENDING, 0, NULL) > 0) {
+			n = 1;
+		    }
+		}
 	    }
 	    Ns_MutexUnlock(&sa->lock);
 	}

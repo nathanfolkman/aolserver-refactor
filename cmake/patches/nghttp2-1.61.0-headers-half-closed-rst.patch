@@ -1,0 +1,22 @@
+--- a/lib/nghttp2_session.c
++++ b/lib/nghttp2_session.c
+@@ -4369,16 +4369,9 @@ int nghttp2_session_on_headers_received(nghttp2_session *session,
+         session, frame, NGHTTP2_ERR_PROTO, "HEADERS: stream_id == 0");
+   }
+   if ((stream->shut_flags & NGHTTP2_SHUT_RD)) {
+-    /* half closed (remote): from the spec:
+-
+-       If an endpoint receives additional frames for a stream that is
+-       in this state it MUST respond with a stream error (Section
+-       5.4.2) of type STREAM_CLOSED.
+-
+-       we go further, and make it connection error.
+-    */
+-    return session_inflate_handle_invalid_connection(
+-        session, frame, NGHTTP2_ERR_STREAM_CLOSED, "HEADERS: stream closed");
++    /* RFC 7540 5.1: stream error STREAM_CLOSED (h2spec http2/5.1 half-closed). */
++    return session_inflate_handle_invalid_stream(
++        session, frame, NGHTTP2_ERR_STREAM_CLOSED);
+   }
+   if (nghttp2_session_is_my_stream_id(session, frame->hd.stream_id)) {
+     if (stream->state == NGHTTP2_STREAM_OPENED) {

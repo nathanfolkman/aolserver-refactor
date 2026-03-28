@@ -553,7 +553,12 @@ typedef enum {
      * TLS only: return 1 if OpenSSL has decrypted application data waiting
      * for SSL_read (poll may miss POLLIN when ciphertext is already consumed).
      */
-    DriverTlsAppPending
+    DriverTlsAppPending,
+    /*
+     * TLS only: return 1 if OpenSSL still needs to write (e.g. buffered record
+     * not flushed to the socket). Complements nghttp2 want_write for h2spec.
+     */
+    DriverTlsWantWrite
 } Ns_DriverCmd;
 
 /*

@@ -15,6 +15,9 @@ jobs:
   tls-h2spec-http1:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      # minimal.tcl nssock bind; avoids rare "Address already in use" on 8080.
+      NSSOCK_PORT: "18080"
     steps:
       - uses: actions/checkout@v4
 
@@ -32,20 +35,22 @@ jobs:
           curl -fsSL https://github.com/summerwind/h2spec/releases/download/v2.6.0/h2spec_linux_amd64.tar.gz | tar xz
           sudo install -m755 h2spec /usr/local/bin/
 
-      - name: Run h2spec
+      # Optional debug (uncomment): AOLSERVER_H2_FEED_LOG: "1" — stderr nghttp2 mem_recv errors (nsd/http2.c).
+      # Run h2spec and HTTP/1 in one step so both always execute; exit non-zero if either failed.
+      - name: Run h2spec and HTTP/1 conformance
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/build/nsd:${{ github.workspace }}/build/nsthread:${{ github.workspace }}/deps-install/lib
           NS_TCL_LIBRARY: ${{ github.workspace }}/deps-install/lib/tcl8.6
           H2SPEC_TIMEOUT: "120"
           H2SPEC_STARTUP_SLEEP: "15"
-        run: tests/h2test/run-h2spec.sh --start-nsd
-
-      - name: HTTP/1 conformance (curl + Tcl http.test)
-        env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/build/nsd:${{ github.workspace }}/build/nsthread:${{ github.workspace }}/deps-install/lib
-          NS_TCL_LIBRARY: ${{ github.workspace }}/deps-install/lib/tcl8.6
           HTTP1_STARTUP_SLEEP: "15"
-        run: chmod +x tests/h1test/run-http1-tests.sh && tests/h1test/run-http1-tests.sh --start-nsd
+        run: |
+          set -euo pipefail
+          rc=0
+          tests/h2test/run-h2spec.sh --start-nsd || rc=1
+          chmod +x tests/h1test/run-http1-tests.sh
+          tests/h1test/run-http1-tests.sh --start-nsd || rc=1
+          exit "$rc"
 
   tls-h3spec:
     runs-on: ubuntu-24.04

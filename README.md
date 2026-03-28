@@ -75,6 +75,7 @@ Notable fixes in this codebase:
 - **OpenSSL read drain:** After a successful `SSL_read`, `DriverRecv` loops on `SSL_has_pending(ssl)` so additional decrypted application data in the SSL buffer is returned in the same driver call (avoids waiting on `poll()` when the TCP queue is already empty).
 - **Outbound flush before read:** In `SOCK_READWAIT`, the driver calls `NsHttp2TrySend` for every HTTP/2 socket with a session, not only when `POLLOUT` appears in `revents`, so pending SETTINGS/PING responses are not starved on stacks that omit `POLLOUT` until a write is attempted.
 - **Handshake concurrency:** `sslInitLock` in `nsssl` is not held across `SslAcceptNonBlocking` (which may poll for a long time), so other connections are not blocked for the whole server TLS handshake.
+- **ALPN + TLS resume + h2 preface:** `SSL_get0_alpn_selected` can be empty on resumed sessions while the peer still sends HTTP/2; `nsssl` no longer defaults those connections to HTTP/1.1. When ALPN is still unknown, the first decrypted bytes are checked for the RFC 7540 connection preface (`PRI * HTTP/2.0…`). The TLS read path also drains successive TLS records when TCP still has ciphertext (preface split across records).
 - **Driver / reader:** HTTP/2 TLS sockets returned from the reader in `SOCK_READWAIT` (e.g. after `SSL_ERROR_WANT_READ`) are re-queued on the driver poll list instead of the pre-queue path that closes non-`SOCK_PREQUE` sockets.
 - **Reader thread:** When `h2NeedDriverPoll` is set, control returns to the driver with an explicit `goto` after one `SockRead` iteration so the connection is not spun in the reader with extra `SSL_read` calls. Without that flag, HTTP/2 still allows up to **`h2readburst`** `SockRead` calls per driver wakeup (default **16**) so SETTINGS can complete in one batch; beyond that, the socket returns to the driver to avoid `POLLIN`/`SSL_read==0` spin (h2spec PING, etc.).
 - **`NsHttp2TrySend` / TLS:** If `nghttp2_session_want_write` remains true after `nghttp2_session_send` (e.g. `SSL_write` stopped with `WANT_READ`), the implementation issues a non-blocking `DriverRecv` and feeds the result with `mem_recv` before retrying send, so SETTINGS ACK and follow-on client frames are not stuck behind a half-flushed TLS write.
@@ -192,6 +193,88 @@ The helper script `tests/h2test/h2_ping_client.py` sets **`ENABLE_PUSH` to 0** b
 export AOLSERVER_H2_DEBUG=1
 # run nsd; stderr shows SockClose / NsHttp2Feed lines
 ```
+
+### h2spec failure checklist (work in progress)
+
+Use this list to track **remaining** h2spec failures. Mark an item **`[x]`** when it passes on your target (local macOS, Docker `linux/amd64`, or CI). **IDs** match **`h2spec`** arguments (e.g. `h2spec generic/2/3 -t -k …`).
+
+**Last full Docker `linux/amd64` run** (same image as CI; **`./docker/run-ci-build.sh --h2spec`**, **`H2SPEC_TIMEOUT` ≥ 180): **146** tests — **101** passed, **44** failed, **1** skipped (~26–30+ minutes). Re-run after substantive HTTP/2 changes and update this section.
+
+**Refresh the list** after a full run (expect **~25–35 minutes**; raise per-case timeout for slow environments, e.g. **`H2SPEC_TIMEOUT=300`**):
+
+```sh
+export NSD_BUILD_DIR="$PWD/build" NSSOCK_PORT=18080 H2SPEC_TIMEOUT=300
+export JUNIT="$PWD/h2spec-junit.xml"
+export DYLD_LIBRARY_PATH="$NSD_BUILD_DIR/nsd:$NSD_BUILD_DIR/nsthread:$PWD/deps-install/lib"
+export NS_TCL_LIBRARY="$PWD/deps-install/lib/tcl8.6"
+./tests/h2test/run-h2spec.sh --start-nsd 2>&1 | tee h2spec-full.log
+# Failures in the log are lines starting with "×" (U+00D7). JUnit lists testcase elements with <failure>.
+```
+
+**Note:** **`nsssl`** now (a) avoids defaulting to HTTP/1.1 when ALPN is unset after TLS session resumption (Go clients resume after the first h2spec case), (b) classifies HTTP/2 from the **`PRI * HTTP/2.0`** preface when needed, and (c) continues **`SSL_read`** while TCP still has ciphertext so the connection preface can span multiple TLS records. **`http2.c`** avoids mapping **`NsHttp2TrySend`** TLS-EOF-shaped drains to **`E_CLOSE`** in a few paths. Remaining failures are real protocol/stack gaps; **re-run the full suite** after fixes and update IDs below.
+
+#### Generic (`h2spec generic/…`)
+
+| ID | Description (short) |
+|----|---------------------|
+| `generic/2/3` | PRIORITY on half-closed (remote) stream (after SETTINGS IVS=0, WINDOW_UPDATE) |
+| `generic/2/5` | PRIORITY on closed stream |
+| `generic/3.1/1` | Sends a DATA frame (POST body; expect response HEADERS) |
+| `generic/3.1/2` | Sends multiple DATA frames |
+| `generic/3.1/3` | Sends a DATA frame with padding |
+| `generic/3.2/1` | Sends a HEADERS frame |
+| `generic/3.2/2` | Sends a HEADERS frame with padding |
+| `generic/3.2/3` | Sends a HEADERS frame with priority |
+| `generic/3.3/1` | PRIORITY with priority 1 |
+| `generic/3.3/2` | PRIORITY with priority 256 |
+| `generic/3.3/3` | PRIORITY with stream dependency |
+| `generic/3.3/4` | PRIORITY with exclusive |
+| `generic/3.3/5` | PRIORITY on idle stream then HEADERS on lower stream ID |
+| `generic/3.9/2` | WINDOW_UPDATE with stream ID 1 |
+| `generic/3.10/1` | CONTINUATION frame |
+| `generic/3.10/2` | Multiple CONTINUATION frames |
+| `generic/4/1` | GET request |
+| `generic/4/2` | HEAD request |
+| `generic/4/3` | POST request |
+| `generic/4/4` | POST with trailers |
+| `generic/5/1`–`generic/5/15` | HPACK indexed / literal / dynamic table cases |
+
+Checklist (copy and flip **`[ ]` → `[x]`** as you go):
+
+- [ ] `generic/2/3`
+- [ ] `generic/2/5`
+- [ ] `generic/3.1/1` `generic/3.1/2` `generic/3.1/3`
+- [ ] `generic/3.2/1` `generic/3.2/2` `generic/3.2/3`
+- [ ] `generic/3.3/1` `generic/3.3/2` `generic/3.3/3` `generic/3.3/4` `generic/3.3/5`
+- [ ] `generic/3.9/2`
+- [ ] `generic/3.10/1` `generic/3.10/2`
+- [ ] `generic/4/1` `generic/4/2` `generic/4/3` `generic/4/4`
+- [ ] `generic/5/1` `generic/5/2` `generic/5/3` `generic/5/4` `generic/5/5` `generic/5/6` `generic/5/7` `generic/5/8` `generic/5/9` `generic/5/10` `generic/5/11` `generic/5/12` `generic/5/13` `generic/5/14` `generic/5/15`
+
+#### HTTP/2 RFC suite (`h2spec http2/…`)
+
+| ID | Description (short) |
+|----|---------------------|
+| `http2/4.2/1` | DATA frame with 2^14 octets length |
+| `http2/5.1/11` | closed: DATA frame (expect stream error STREAM_CLOSED) |
+| `http2/5.1/12` | closed: HEADERS frame |
+| `http2/5.1/13` | closed: CONTINUATION frame |
+| `http2/6.5.3/1` | Multiple values of SETTINGS_INITIAL_WINDOW_SIZE |
+| `http2/6.9.1/1` | SETTINGS initial window 1 + HEADERS |
+| `http2/6.9.2/1` | Changes SETTINGS_INITIAL_WINDOW_SIZE after HEADERS |
+| `http2/6.9.2/2` | SETTINGS for window size negative |
+| `http2/6.10/1` | Multiple CONTINUATION frames preceded by HEADERS |
+
+Checklist:
+
+- [ ] `http2/4.2/1`
+- [ ] `http2/5.1/11` `http2/5.1/12` `http2/5.1/13`
+- [ ] `http2/6.5.3/1`
+- [ ] `http2/6.9.1/1`
+- [ ] `http2/6.9.2/1` `http2/6.9.2/2`
+- [ ] `http2/6.10/1`
+
+**After `http2/6.10/1`:** the full suite continues (e.g. more **`http2/6.10`** cases, **`http2/7`**, **`http2/8`**). If your **`h2spec-full.log`** ends before **“Finished”** / final summary counts, re-run and append any additional failing IDs here.
 
 ## HTTP/3 (QUIC, ALPN `h3`)
 

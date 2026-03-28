@@ -12,3 +12,9 @@
 
 # Self-signed TLS for tests/h2test/minimal.tcl (generated locally; never commit)
 /tests/h2test/servers/s1/modules/nsssl/*.pem
+
+# Local h2spec full-run capture (see README "h2spec failure checklist")
+/h2spec-full.log
+/h2spec-junit.xml
+/h2spec-docker.log
+/h2spec-docker-junit.xml

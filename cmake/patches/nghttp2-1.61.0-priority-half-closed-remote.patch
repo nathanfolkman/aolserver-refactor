@@ -1,0 +1,27 @@
+--- a/lib/nghttp2_session.c
++++ b/lib/nghttp2_session.c
+@@ -4481,11 +4481,20 @@ int nghttp2_session_on_priority_received(nghttp2_session *session,
+       return rv;
+     }
+   } else {
+-    rv = nghttp2_session_reprioritize_stream(session, stream,
+-                                             &frame->priority.pri_spec);
++    /*
++     * RFC 7540 5.1: WINDOW_UPDATE, PRIORITY, and RST_STREAM are permitted on
++     * half-closed (remote). Reprioritization may not apply once inbound reads
++     * are shut; accept the frame (h2spec generic/2/3).
++     */
++    if (stream->shut_flags & NGHTTP2_SHUT_RD) {
++      rv = 0;
++    } else {
++      rv = nghttp2_session_reprioritize_stream(session, stream,
++                                               &frame->priority.pri_spec);
+ 
+-    if (nghttp2_is_fatal(rv)) {
+-      return rv;
++      if (nghttp2_is_fatal(rv)) {
++        return rv;
++      }
+     }
+ 
+     rv = nghttp2_session_adjust_idle_stream(session);

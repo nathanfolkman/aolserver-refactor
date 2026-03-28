@@ -1,0 +1,19 @@
+--- a/lib/nghttp2_session.c
++++ b/lib/nghttp2_session.c
+@@ -5703,6 +5703,16 @@ static int session_on_data_received_fail_fast(nghttp2_session *session) {
+   }
+   return 0;
+ fail:
++  /* RFC 7540 5.1: stream errors use RST_STREAM; connection close breaks h2spec
++   * http2/5.1.11 (DATA on half-closed/closed stream expects STREAM_CLOSED). */
++  if (error_code == NGHTTP2_STREAM_CLOSED) {
++    rv = session_handle_invalid_stream2(session, stream_id, &iframe->frame,
++                                        NGHTTP2_ERR_STREAM_CLOSED);
++    if (nghttp2_is_fatal(rv)) {
++      return rv;
++    }
++    return NGHTTP2_ERR_IGN_PAYLOAD;
++  }
+   rv = nghttp2_session_terminate_session_with_reason(session, error_code,
+                                                      failure_reason);
+   if (nghttp2_is_fatal(rv)) {

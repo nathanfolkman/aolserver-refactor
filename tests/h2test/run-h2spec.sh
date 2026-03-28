@@ -11,6 +11,8 @@
 #
 # Optional: H2SPEC_ARGS="generic/2/1" to run a single case; JUNIT=path for -j report.
 # NSD_SHUTDOWN_WAIT_SEC — max seconds after SIGTERM before SIGKILL when stopping nsd (default 45).
+# AOLSERVER_H2_FEED_LOG=1 — stderr lines on nghttp2 mem_recv / session failures (nsd/http2.c); use when
+#   h2spec shows Connection closed / invalid header (E_HINVAL) and you need the nghttp2 error string.
 
 set -eo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"

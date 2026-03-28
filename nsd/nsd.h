@@ -444,7 +444,7 @@ typedef struct Sock {
     struct Conn *h2PendingBodyConn; /* Conns waiting for nghttp2 to finish reading response DATA */
     struct Conn *h2PostSendFreeConn; /* NsFreeConn after session_send (not from read callback) */
     int h2NeedDriverPoll; /* TLS WANT_READ: return sock to driver instead of reader spin */
-    uint32_t h2_peer_ivs_value; /* last INITIAL_WINDOW_SIZE from peer SETTINGS (0 = none seen) */
+    uint32_t h2_peer_ivs_value; /* last peer SETTINGS INITIAL_WINDOW_SIZE; UINT32_MAX = not yet recorded */
     void *h2DeferFirst; /* H2Defer (http2.c): streams ready after full mem_recv */
     void *h2DeferLast;
     struct sockaddr_in sa;
@@ -1039,7 +1039,13 @@ extern void NsHttp2DriverStatsGet(Driver *drvPtr, NsHttp2Stats *outPtr);
 extern void NsHttp2EnsureSession(Sock *sockPtr);
 extern int NsHttp2Feed(Driver *drvPtr, Sock *sockPtr, Conn *connPtr,
                        const unsigned char *data, size_t datalen);
+/*
+ * Flush pending HTTP/2 outbound data (nghttp2 send + TLS drain when needed).
+ * Returns 0 on success; negative values distinguish TLS EOF, fatal session_send,
+ * and mem_recv failure during drain (see implementation in http2.c).
+ */
 extern int NsHttp2TrySend(Sock *sockPtr);
+extern void NsHttp2ReaderYieldFlush(Sock *sockPtr);
 extern int NsHttp2WantReadInput(Sock *sockPtr);
 extern int NsHttp2ConnSend(Conn *connPtr, struct iovec *bufs, int nbufs);
 extern int NsHttp2ConnFlushDirect(Ns_Conn *conn, char *buf, int len, int stream);

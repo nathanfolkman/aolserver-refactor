@@ -6,6 +6,12 @@
 
 #if HAVE_NGHTTP2
 
+/*
+ * Sock::h2_peer_ivs_value uses UINT32_MAX until the first peer SETTINGS IVS
+ * is recorded; 0 is valid (explicit INITIAL_WINDOW_SIZE zero — h2spec generic/2).
+ */
+#define H2_PEER_IVS_UNKNOWN UINT32_MAX
+
 #include <nghttp2/nghttp2.h>
 #include <ctype.h>
 #include <stdarg.h>
@@ -58,6 +64,47 @@ H2DebugEnv(void)
     return cache;
 }
 
+/*
+ * When AOLSERVER_H2_FEED_LOG is set (non-empty, not "0"), log mem_recv and
+ * other feed failures to stderr (CI / one-off h2spec debugging). Does not log
+ * successful feeds (unlike AOLSERVER_H2_DEBUG).
+ */
+static int
+H2FeedLogEnv(void)
+{
+    static int cache = -1;
+
+    if (cache < 0) {
+	const char *e = getenv("AOLSERVER_H2_FEED_LOG");
+
+	if (e == NULL || e[0] == '\0' || strcmp(e, "0") == 0) {
+	    cache = 0;
+	} else {
+	    cache = 1;
+	}
+    }
+    return cache;
+}
+
+static void
+H2FeedLogMemRecvErr(Sock *sock, ssize_t readlen, size_t remain, size_t inlen)
+{
+    if (!H2FeedLogEnv()) {
+	return;
+    }
+    if (readlen < 0) {
+	fprintf(stderr,
+		"AOLSERVER_H2_FEED_LOG sock=%u mem_recv err=%d (%s) inlen=%lu remain_after=%lu\n",
+		sock->id, (int) readlen, nghttp2_strerror((int) readlen),
+		(unsigned long) inlen, (unsigned long) remain);
+    } else {
+	fprintf(stderr,
+		"AOLSERVER_H2_FEED_LOG sock=%u mem_recv returned 0 inlen=%lu remain=%lu (unexpected)\n",
+		sock->id, (unsigned long) inlen, (unsigned long) remain);
+    }
+    fflush(stderr);
+}
+
 static void
 H2DebugFeedMsg(const char *msg, unsigned int sockId, size_t datalen, int rv,
 	       const char *extra)
@@ -82,6 +129,16 @@ enum {
     H2_E_OK = 0,
     H2_E_HINVAL = 9
 };
+
+/*
+ * NsHttp2TrySend: 0 = success; -1 = TLS EOF while draining for send;
+ * -2 = nghttp2_session_send fatal; -3 = mem_recv fatal in drain loop.
+ * (WOULDBLOCK from TLS maps to session_send returning 0 — not an error here.)
+ */
+#define H2_TRYSEND_OK 0
+#define H2_TRYSEND_TLS_EOF (-1)
+#define H2_TRYSEND_SESSION_SEND_ERR (-2)
+#define H2_TRYSEND_MEM_RECV_ERR (-3)
 
 static _Atomic unsigned long long h2_stat_feed_ok;
 static _Atomic unsigned long long h2_stat_feed_mem_recv_err;
@@ -531,7 +588,8 @@ static int H2OnFrameRecv(nghttp2_session *session, const nghttp2_frame *frame,
 		 * Keep the smaller recorded IVS until the peer sends a
 		 * non-default value again.
 		 */
-		if (v == NGHTTP2_INITIAL_WINDOW_SIZE && sock->h2_peer_ivs_value != 0u
+		if (v == NGHTTP2_INITIAL_WINDOW_SIZE
+			&& sock->h2_peer_ivs_value != H2_PEER_IVS_UNKNOWN
 			&& sock->h2_peer_ivs_value < NGHTTP2_INITIAL_WINDOW_SIZE) {
 		    continue;
 		}
@@ -544,7 +602,8 @@ static int H2OnFrameRecv(nghttp2_session *session, const nghttp2_frame *frame,
 		 * the whole body before flow control (h2spec http2/6.9.2/2). Keep 0 until
 		 * a non-default IVS so min(rivs, piv) follows nghttp2 remote settings.
 		 */
-		if (v == NGHTTP2_INITIAL_WINDOW_SIZE && sock->h2_peer_ivs_value == 0u) {
+		if (v == NGHTTP2_INITIAL_WINDOW_SIZE
+			&& sock->h2_peer_ivs_value == H2_PEER_IVS_UNKNOWN) {
 		    continue;
 		}
 		sock->h2_peer_ivs_value = v;
@@ -795,6 +854,11 @@ static nghttp2_session *H2SessionNew(Sock *sock)
      * UINT64_MAX: avoids surprising ratelim math in edge builds).
      */
     nghttp2_option_set_stream_reset_rate_limit(opt, 100000000ULL, 100000000ULL);
+    /*
+     * Process RFC 7540 PRIORITY when the peer uses default SETTINGS or has not
+     * disabled legacy priorities (h2spec and many clients).
+     */
+    nghttp2_option_set_server_fallback_rfc7540_priorities(opt, 1);
     rv = nghttp2_session_server_new2(&session, callbacks, sock, opt);
     nghttp2_option_del(opt);
     nghttp2_session_callbacks_del(callbacks);
@@ -851,11 +915,13 @@ H2MemRecvLocked(Sock *sockPtr, nghttp2_session *session, const unsigned char *da
     while (remain > 0) {
 	readlen = nghttp2_session_mem_recv(session, p, remain);
 	if (readlen < 0) {
+	    H2FeedLogMemRecvErr(sockPtr, readlen, remain, datalen);
 	    H2Trace("H2MemRecvLocked err %s remain=%lu",
 		    nghttp2_strerror((int) readlen), (unsigned long) remain);
 	    return -1;
 	}
 	if (readlen == 0) {
+	    H2FeedLogMemRecvErr(sockPtr, 0, remain, datalen);
 	    H2Trace("H2MemRecvLocked mem_recv 0 remain=%lu",
 		    (unsigned long) remain);
 	    return -1;
@@ -940,10 +1006,12 @@ H2SyncPeerIvsFromSession(Sock *sock, nghttp2_session *session)
      * When piv is non-zero and rs changes (e.g. 3 -> 2), update to match
      * nghttp2 remote settings.
      */
-    if (sock->h2_peer_ivs_value == 0u && rs == NGHTTP2_INITIAL_WINDOW_SIZE) {
+    if (sock->h2_peer_ivs_value == H2_PEER_IVS_UNKNOWN
+	    && rs == NGHTTP2_INITIAL_WINDOW_SIZE) {
 	return;
     }
-    if (rs == NGHTTP2_INITIAL_WINDOW_SIZE && sock->h2_peer_ivs_value != 0u
+    if (rs == NGHTTP2_INITIAL_WINDOW_SIZE
+	    && sock->h2_peer_ivs_value != H2_PEER_IVS_UNKNOWN
 	    && sock->h2_peer_ivs_value < NGHTTP2_INITIAL_WINDOW_SIZE) {
 	return;
     }
@@ -953,7 +1021,7 @@ H2SyncPeerIvsFromSession(Sock *sock, nghttp2_session *session)
 }
 
 /*
- * While h2_peer_ivs_value is still 0 and nghttp2 reports the RFC default IVS,
+ * While h2_peer_ivs_value is still UNKNOWN and nghttp2 reports the RFC default IVS,
  * keep draining TLS and syncing so SETTINGS_INITIAL_WINDOW_SIZE from the peer
  * reaches mem_recv before we emit many 1-byte DATA frames (see H2StreamBodyRead
  * probe and h2spec http2/6.9.2/2).
@@ -970,7 +1038,7 @@ H2FeedUntilPeerIvsKnown(Sock *sock, nghttp2_session *session)
 	uint32_t rchk = nghttp2_session_get_remote_settings(session,
 		NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE);
 
-	if (sock->h2_peer_ivs_value != 0u
+	if (sock->h2_peer_ivs_value != H2_PEER_IVS_UNKNOWN
 		|| rchk != NGHTTP2_INITIAL_WINDOW_SIZE) {
 	    break;
 	}
@@ -979,7 +1047,7 @@ H2FeedUntilPeerIvsKnown(Sock *sock, nghttp2_session *session)
 	rchk = nghttp2_session_get_remote_settings(session,
 		NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE);
 	if (rchk != NGHTTP2_INITIAL_WINDOW_SIZE
-		|| sock->h2_peer_ivs_value != 0u) {
+		|| sock->h2_peer_ivs_value != H2_PEER_IVS_UNKNOWN) {
 	    break;
 	}
     }
@@ -1173,7 +1241,7 @@ NsHttp2TrySend(Sock *sockPtr)
 	    Ns_MutexUnlock(&sockPtr->h2Lock);
 	    H2WakeDriverIfPending(sockPtr, session);
 	    if (rv != 0) {
-		return rv;
+		return H2_TRYSEND_SESSION_SEND_ERR;
 	    }
 	    if (!want) {
 		break;
@@ -1189,7 +1257,7 @@ NsHttp2TrySend(Sock *sockPtr)
 	    rv = (*sockPtr->drvPtr->proc)(DriverRecv, (Ns_Sock *) sockPtr, &iov,
 		    1);
 	    if (rv == NS_DRIVER_RECV_TLS_EOF) {
-		return -1;
+		return H2_TRYSEND_TLS_EOF;
 	    }
 	    if (rv <= 0) {
 		break;
@@ -1203,7 +1271,7 @@ NsHttp2TrySend(Sock *sockPtr)
 	    if (H2MemRecvLocked(sockPtr, session, drainBuf, (size_t) rv) != 0) {
 		Ns_MutexUnlock(&sockPtr->h2Lock);
 		H2_DUAL_INC(sockPtr->drvPtr, feed_mem_recv_err);
-		return -1;
+		return H2_TRYSEND_MEM_RECV_ERR;
 	    }
 	    Ns_MutexUnlock(&sockPtr->h2Lock);
 	    H2_DUAL_INC(sockPtr->drvPtr, trysend_drain_reads);
@@ -1236,6 +1304,93 @@ NsHttp2WantReadInput(Sock *sockPtr)
     return want ? 1 : 0;
 }
 
+/*
+ * After mem_recv queues SETTINGS ACK (etc.), non-blocking SSL may leave
+ * ciphertext in OpenSSL's write BIO while the TCP socket still accepts data.
+ * Spin on POLLOUT with a zero-timeout poll and retry TrySend in this thread.
+ * Call this after the first NsHttp2TrySend following mem_recv, but before the
+ * inbound drain loop that peeks TCP: otherwise the peer's handshake goroutine
+ * may still be blocked waiting for SETTINGS ACK while we see no follow-on bytes
+ * (h2spec generic/2/3 after generic/2/2 on a fresh connection).
+ *
+ * Results:
+ *	0 — ok; -1 — mem_recv failure inside TrySend (invalid session).
+ */
+static int
+H2SpinPollOutFlush(Sock *sockPtr)
+{
+    int i;
+    nghttp2_session *session;
+
+    for (i = 0; i < 256 && sockPtr->sock != INVALID_SOCKET; i++) {
+	int want, tlsWant = 0;
+
+	if ((sockPtr->drvPtr->opts & NS_DRIVER_SSL) != 0) {
+	    tlsWant = (*sockPtr->drvPtr->proc)(DriverTlsWantWrite,
+		    (Ns_Sock *) sockPtr, NULL, 0) > 0;
+	}
+	Ns_MutexLock(&sockPtr->h2Lock);
+	session = (nghttp2_session *) sockPtr->http2;
+	want = (session != NULL && nghttp2_session_want_write(session) != 0);
+	Ns_MutexUnlock(&sockPtr->h2Lock);
+	if (!want && !tlsWant) {
+	    return 0;
+	}
+	{
+	    int ts = NsHttp2TrySend(sockPtr);
+
+	    if (ts != H2_TRYSEND_OK) {
+		if (ts == H2_TRYSEND_MEM_RECV_ERR) {
+		    return -1;
+		}
+		if (ts == H2_TRYSEND_TLS_EOF) {
+		    H2_DUAL_INC(sockPtr->drvPtr, trysend_recoveries);
+		} else if (ts != H2_TRYSEND_SESSION_SEND_ERR) {
+		    H2_DUAL_INC(sockPtr->drvPtr, trysend_recoveries);
+		}
+		NsDriverTrigger(sockPtr->drvPtr);
+		return 0;
+	    }
+	}
+	{
+	    struct pollfd pfd;
+
+	    pfd.fd = sockPtr->sock;
+	    pfd.events = POLLOUT;
+	    pfd.revents = 0;
+	    if (poll(&pfd, 1, 0) != 1 || (pfd.revents & POLLOUT) == 0) {
+		NsDriverTrigger(sockPtr->drvPtr);
+		return 0;
+	    }
+	}
+    }
+    NsDriverTrigger(sockPtr->drvPtr);
+    return 0;
+}
+
+/*
+ * Before the reader thread returns an HTTP/2 socket to the driver, push any
+ * queued SETTINGS ACK / TLS ciphertext to the wire. Peers (Go's net/http2,
+ * h2spec) often block the next write until they observe server frames; if we
+ * yield first, the follow-on TCP segment never arrives (generic/2/3 after 2/2).
+ */
+void
+NsHttp2ReaderYieldFlush(Sock *sockPtr)
+{
+    if (((Ns_Sock *) sockPtr)->app_protocol != NS_APP_PROTO_H2
+	    || sockPtr->sock == INVALID_SOCKET) {
+	return;
+    }
+    NsHttp2EnsureSession(sockPtr);
+    if (sockPtr->http2 == NULL) {
+	return;
+    }
+    (void) NsHttp2TrySend(sockPtr);
+    if ((sockPtr->drvPtr->opts & NS_DRIVER_SSL) != 0) {
+	(void) H2SpinPollOutFlush(sockPtr);
+    }
+}
+
 int
 NsHttp2Feed(Driver *drvPtr, Sock *sockPtr, Conn *connPtr,
             const unsigned char *data, size_t datalen)
@@ -1253,6 +1408,12 @@ NsHttp2Feed(Driver *drvPtr, Sock *sockPtr, Conn *connPtr,
         session = H2SessionNew(sockPtr);
         if (session == NULL) {
             Ns_MutexUnlock(&sockPtr->h2Lock);
+	    if (H2FeedLogEnv()) {
+		fprintf(stderr,
+			"AOLSERVER_H2_FEED_LOG sock=%u H2SessionNew failed datalen=%lu\n",
+			sockPtr->id, (unsigned long) datalen);
+		fflush(stderr);
+	    }
 	    H2DebugFeedMsg("H2SessionNew failed", sockPtr->id, datalen,
 		    H2_E_HINVAL, NULL);
             return H2_E_HINVAL;
@@ -1288,15 +1449,52 @@ NsHttp2Feed(Driver *drvPtr, Sock *sockPtr, Conn *connPtr,
      * Deferred streams are dispatched from NsHttp2TrySend only after outbound
      * data (e.g. SETTINGS) is flushed so frames are not reordered on the wire.
      */
-    if (NsHttp2TrySend(sockPtr) != 0) {
-	H2Trace("NsHttp2Feed NsHttp2TrySend failed (non-fatal; trigger driver)");
-	H2DebugFeedMsg(
-		"NsHttp2TrySend failed — treat as WOULDBLOCK; mem_recv ok",
-		sockPtr->id, datalen, H2_E_OK, NULL);
-	H2_DUAL_INC(sockPtr->drvPtr, trysend_recoveries);
-	NsDriverTrigger(sockPtr->drvPtr);
-	H2_DUAL_INC(sockPtr->drvPtr, feed_ok);
-	return H2_E_OK;
+    {
+	int ts;
+
+	ts = NsHttp2TrySend(sockPtr);
+	if (ts != H2_TRYSEND_OK) {
+	    /*
+	     * TrySend may read TLS while flushing; SSL can report EOF-shaped
+	     * conditions that are transient (SYSCALL/0, timing). Treating that
+	     * as E_CLOSE here tore down connections during h2spec (generic/2/3,
+	     * Docker). Real clean shutdown is still observed on the main
+	     * DriverRecv path in SockReadLine.
+	     */
+	    if (ts == H2_TRYSEND_TLS_EOF) {
+		H2Trace("NsHttp2TrySend TLS EOF during drain — trigger driver");
+		H2DebugFeedMsg("NsHttp2TrySend TLS EOF (non-fatal; trigger driver)",
+			sockPtr->id, datalen, H2_E_OK, NULL);
+		H2_DUAL_INC(sockPtr->drvPtr, trysend_recoveries);
+		NsDriverTrigger(sockPtr->drvPtr);
+		H2_DUAL_INC(sockPtr->drvPtr, feed_ok);
+		return H2_E_OK;
+	    }
+	    if (ts == H2_TRYSEND_MEM_RECV_ERR) {
+		H2Trace("NsHttp2Feed NsHttp2TrySend mem_recv fatal in drain");
+		H2DebugFeedMsg("NsHttp2TrySend mem_recv failed — invalid session",
+			sockPtr->id, datalen, H2_E_HINVAL, NULL);
+		return H2_E_HINVAL;
+	    }
+	    /*
+	     * session_send returned a non-WOULDBLOCK error; keep scheduling
+	     * another driver turn (legacy behavior) rather than forcing E_HINVAL.
+	     */
+	    H2Trace("NsHttp2Feed NsHttp2TrySend session_send failed (non-fatal; trigger driver)");
+	    H2DebugFeedMsg(
+		    "NsHttp2TrySend session_send failed — trigger driver",
+		    sockPtr->id, datalen, H2_E_OK, NULL);
+	    H2_DUAL_INC(sockPtr->drvPtr, trysend_recoveries);
+	    NsDriverTrigger(sockPtr->drvPtr);
+	    H2_DUAL_INC(sockPtr->drvPtr, feed_ok);
+	    return H2_E_OK;
+	}
+    }
+    if ((sockPtr->drvPtr->opts & NS_DRIVER_SSL) != 0) {
+	if (H2SpinPollOutFlush(sockPtr) != 0) {
+	    H2_DUAL_INC(sockPtr->drvPtr, feed_mem_recv_err);
+	    return H2_E_HINVAL;
+	}
     }
     /*
      * While ciphertext is already in the TCP buffer, keep feeding nghttp2 in
@@ -1329,7 +1527,18 @@ NsHttp2Feed(Driver *drvPtr, Sock *sockPtr, Conn *connPtr,
 	    iov.iov_len = sizeof(more);
 	    n = (*drvPtr->proc)(DriverRecv, (Ns_Sock *) sockPtr, &iov, 1);
 	    if (n == NS_DRIVER_RECV_TLS_EOF) {
-		return 1;
+		/*
+		 * Same as TrySend drain: EOF-shaped TLS read here must not map
+		 * to E_CLOSE (rv=1); that closed connections mid-h2spec
+		 * (generic/2/3, generic/3.1/1) after the first mem_recv chunk.
+		 */
+		H2Trace("NsHttp2Feed drain DriverRecv TLS EOF — non-fatal");
+		H2DebugFeedMsg("drain TLS EOF (non-fatal; trigger driver)",
+			sockPtr->id, datalen, H2_E_OK, NULL);
+		H2_DUAL_INC(sockPtr->drvPtr, trysend_recoveries);
+		NsDriverTrigger(sockPtr->drvPtr);
+		H2_DUAL_INC(sockPtr->drvPtr, feed_ok);
+		return H2_E_OK;
 	    }
 	    if (n <= 0) {
 		break;
@@ -1338,6 +1547,12 @@ NsHttp2Feed(Driver *drvPtr, Sock *sockPtr, Conn *connPtr,
 	    session = (nghttp2_session *) sockPtr->http2;
 	    if (session == NULL) {
 		Ns_MutexUnlock(&sockPtr->h2Lock);
+		if (H2FeedLogEnv()) {
+		    fprintf(stderr,
+			    "AOLSERVER_H2_FEED_LOG sock=%u NsHttp2Feed drain: session NULL after recv n=%d\n",
+			    sockPtr->id, n);
+		    fflush(stderr);
+		}
 		return H2_E_HINVAL;
 	    }
 	    if (H2MemRecvLocked(sockPtr, session, more, (size_t) n) != 0) {
@@ -1348,14 +1563,41 @@ NsHttp2Feed(Driver *drvPtr, Sock *sockPtr, Conn *connPtr,
 	    H2_DUAL_ADD(sockPtr->drvPtr, bytes_fed, (unsigned long long) n);
 	    H2ResumeDeferredAfterInbound(sockPtr, session);
 	    Ns_MutexUnlock(&sockPtr->h2Lock);
-	    if (NsHttp2TrySend(sockPtr) != 0) {
-		H2_DUAL_INC(sockPtr->drvPtr, trysend_recoveries);
-		NsDriverTrigger(sockPtr->drvPtr);
-		H2Trace("NsHttp2Feed drain TrySend failed (non-fatal)");
-		break;
+	    {
+		int ts = NsHttp2TrySend(sockPtr);
+
+		if (ts != H2_TRYSEND_OK) {
+		    if (ts == H2_TRYSEND_TLS_EOF) {
+			H2_DUAL_INC(sockPtr->drvPtr, trysend_recoveries);
+			NsDriverTrigger(sockPtr->drvPtr);
+			break;
+		    }
+		    if (ts == H2_TRYSEND_MEM_RECV_ERR) {
+			return H2_E_HINVAL;
+		    }
+		    H2_DUAL_INC(sockPtr->drvPtr, trysend_recoveries);
+		    NsDriverTrigger(sockPtr->drvPtr);
+		    H2Trace("NsHttp2Feed drain TrySend session_send failed (non-fatal)");
+		    break;
+		}
 	    }
 	}
     }
+    /*
+     * mem_recv + drain may stop while nghttp2 still expects more inbound
+     * frames (next TLS record not decrypted yet, or next TCP segment not
+     * arrived). Poll alone can miss the follow-up read (Darwin + second
+     * h2spec connection in one process — generic/2/3 after generic/2/2).
+     *
+     * nghttp2_session_want_read() does not reflect incomplete HPACK / frame
+     * assembly; peek can race before the next TCP segment lands. Always wake
+     * the driver once after a successful feed so another poll/reader turn can
+     * read follow-on bytes (PING after PRIORITY, second TLS record, etc.).
+     *
+     * Do not key off want_write alone — SETTINGS ACK keeps it true and would
+     * mask the ReaderThread follow-up read (see driver.c).
+     */
+    NsDriverTrigger(sockPtr->drvPtr);
     H2Trace("NsHttp2Feed ok");
     H2DebugFeedMsg("ok", sockPtr->id, datalen, H2_E_OK, NULL);
     H2_DUAL_INC(sockPtr->drvPtr, feed_ok);
@@ -1376,7 +1618,7 @@ NsHttp2SockCleanup(Sock *sockPtr)
         nghttp2_session_del((nghttp2_session *) sockPtr->http2);
         sockPtr->http2 = NULL;
 	sockPtr->h2ResumeDataStreamId = 0;
-	sockPtr->h2_peer_ivs_value = 0;
+	sockPtr->h2_peer_ivs_value = H2_PEER_IVS_UNKNOWN;
     }
     Ns_MutexUnlock(&sockPtr->h2Lock);
 }
@@ -1612,7 +1854,8 @@ H2StreamBodyRead(nghttp2_session *session, int32_t stream_id, uint8_t *buf,
 	 * use one DATA byte per callback until the stream window drops enough that
 	 * other paths take over — rare compared to typical SETTINGS during preface.
 	 */
-	if (sockRef != NULL && sockRef->h2_peer_ivs_value == 0u
+	if (sockRef != NULL
+		&& sockRef->h2_peer_ivs_value == H2_PEER_IVS_UNKNOWN
 		&& rivs == NGHTTP2_INITIAL_WINDOW_SIZE && length > (size_t) 1u) {
 	    length = (size_t) 1u;
 	}
@@ -1642,7 +1885,8 @@ H2StreamBodyRead(nghttp2_session *session, int32_t stream_id, uint8_t *buf,
 	{
 	    uint32_t eff = rivs;
 
-	    if (sockRef != NULL && sockRef->h2_peer_ivs_value > 0u) {
+	    if (sockRef != NULL
+		    && sockRef->h2_peer_ivs_value != H2_PEER_IVS_UNKNOWN) {
 		uint32_t p = sockRef->h2_peer_ivs_value;
 
 		eff = p < eff ? p : eff;
@@ -1683,10 +1927,11 @@ H2StreamBodyRead(nghttp2_session *session, int32_t stream_id, uint8_t *buf,
 
 	    /*
 	     * Handshake may omit recording explicit IVS 65535 (see H2OnFrameRecv);
-	     * then h2_peer_ivs_value stays 0 while nghttp2 rivs already reflects
-	     * SETTINGS(3). Use rivs as effective piv for stale-window defer.
+	     * then h2_peer_ivs_value stays UNKNOWN while nghttp2 rivs already
+	     * reflects SETTINGS(3). Use rivs as effective piv for stale-window defer.
 	     */
-	    if (piv == 0u && rivs > 0u && rivs < NGHTTP2_INITIAL_WINDOW_SIZE) {
+	    if (piv == H2_PEER_IVS_UNKNOWN && rivs > 0u
+		    && rivs < NGHTTP2_INITIAL_WINDOW_SIZE) {
 		piv = rivs;
 	    }
 
@@ -1766,11 +2011,16 @@ H2StreamBodyRead(nghttp2_session *session, int32_t stream_id, uint8_t *buf,
 	     * When sw is still 65535 while get_remote_settings(IVS) is already
 	     * smaller, sw > rivs applies; when both APIs still read 65535, the
 	     * piv branch above uses the SETTINGS frame value.
+	     *
+	     * When rivs is 0 (SETTINGS_INITIAL_WINDOW_SIZE=0), the stream window
+	     * can still be > 0 after WINDOW_UPDATE; do not clamp length to rivs
+	     * (would force 0 and block DATA — h2spec generic/2/2, 2/3).
 	     */
-	    if (sw == (int32_t) NGHTTP2_INITIAL_WINDOW_SIZE
+	    if (rivs > 0u
+		    && sw == (int32_t) NGHTTP2_INITIAL_WINDOW_SIZE
 		    && rivs < NGHTTP2_INITIAL_WINDOW_SIZE && (size_t) rivs < length) {
 		length = (size_t) rivs;
-	    } else if (sw > (int32_t) rivs && (size_t) rivs < length) {
+	    } else if (rivs > 0u && sw > (int32_t) rivs && (size_t) rivs < length) {
 		length = (size_t) rivs;
 	    }
 	}
@@ -2100,6 +2350,12 @@ NsHttp2TrySend(Sock *sockPtr)
 {
     (void) sockPtr;
     return 0;
+}
+
+void
+NsHttp2ReaderYieldFlush(Sock *sockPtr)
+{
+    (void) sockPtr;
 }
 
 int

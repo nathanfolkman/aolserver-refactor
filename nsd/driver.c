@@ -1502,7 +1502,18 @@ DriverThread(void *arg)
 		    (void) NsHttp2TrySend(sockPtr);
 		}
 	    }
-	    SockWait(sockPtr, &now, drvPtr->recvwait, &waitPtr);
+	    /*
+	     * Follow-on TLS data may arrive after the reader yielded but before
+	     * the next NsPoll; Darwin sometimes omits POLLIN for the next
+	     * segment (h2spec generic/2/3 after generic/2/2). If ciphertext or
+	     * decrypted app bytes are already visible, queue for ReaderThread
+	     * now instead of waiting for poll.
+	     */
+	    if (H2SockHasTcpInput(sockPtr) || H2SockHasTlsAppPending(sockPtr)) {
+		SockPush(sockPtr, &readSockPtr);
+	    } else {
+		SockWait(sockPtr, &now, drvPtr->recvwait, &waitPtr);
+	    }
 	}
 #endif
 
@@ -2036,7 +2047,7 @@ SockAccept(SOCKET lsock, Driver *drvPtr)
     sockPtr->h2PendingBodyConn = NULL;
     sockPtr->h2PostSendFreeConn = NULL;
     sockPtr->h2NeedDriverPoll = 0;
-    sockPtr->h2_peer_ivs_value = 0;
+    sockPtr->h2_peer_ivs_value = UINT32_MAX;
     sockPtr->h2DeferFirst = sockPtr->h2DeferLast = NULL;
 
     /*
@@ -2278,6 +2289,8 @@ SockReadLine(Driver *drvPtr, Ns_Sock *sock, Conn *connPtr)
     struct iovec buf;
     char *s, *e, *hdr, save;
     int len, n, max;
+    int wasUnknownBeforeRecv;
+    int old_len;
 
     /*
      * Setup the request buffer and read more input.
@@ -2306,6 +2319,8 @@ SockReadLine(Driver *drvPtr, Ns_Sock *sock, Conn *connPtr)
     Tcl_DStringSetLength(bufPtr, len);
     buf.iov_base = bufPtr->string + len;
     buf.iov_len = max - len;
+    wasUnknownBeforeRecv =
+	    (((Ns_Sock *) sock)->app_protocol == NS_APP_PROTO_UNKNOWN);
     n = (*drvPtr->proc)(DriverRecv, sock, &buf, 1);
     if (n == NS_DRIVER_RECV_TLS_EOF) {
 	return E_CLOSE;
@@ -2368,17 +2383,29 @@ SockReadLine(Driver *drvPtr, Ns_Sock *sock, Conn *connPtr)
     if (((Ns_Sock *) sock)->app_protocol == NS_APP_PROTO_H2) {
 	((Sock *) sock)->h2NeedDriverPoll = 0;
     }
+    old_len = len;
     len += n;
     Tcl_DStringSetLength(bufPtr, len);
 
 #if HAVE_NGHTTP2
     /*
      * HTTP/2: feed TLS application data to nghttp2 (preface + frames).
+     * If ALPN was unknown, the HTTP/2 connection preface may span multiple
+     * DriverRecv calls; earlier bytes stayed in ibuf while nsssl sniffed.
+     * On the first read where we classify as H2, feed the full ibuf.
      */
 
     if (((Ns_Sock *) sock)->app_protocol == NS_APP_PROTO_H2) {
-	ReadErr h2e = (ReadErr) NsHttp2Feed(drvPtr, (Sock *) sock, connPtr,
-	    (const unsigned char *) (bufPtr->string + (len - n)), (size_t) n);
+	ReadErr h2e;
+
+	if (wasUnknownBeforeRecv && old_len > 0) {
+	    h2e = (ReadErr) NsHttp2Feed(drvPtr, (Sock *) sock, connPtr,
+		    (const unsigned char *) bufPtr->string, (size_t) len);
+	} else {
+	    h2e = (ReadErr) NsHttp2Feed(drvPtr, (Sock *) sock, connPtr,
+		    (const unsigned char *) (bufPtr->string + (len - n)),
+		    (size_t) n);
+	}
 
 	Tcl_DStringTrunc(bufPtr, 0);
 	connPtr->roff = 0;
@@ -3123,10 +3150,30 @@ ReaderThread(void *arg)
 	{
 #if HAVE_NGHTTP2
 	    unsigned int h2ReadBurst = 0;
+	    unsigned int h2PeekRetries = 0;
 #endif
 	    do {
 		SockRead(sockPtr);
 #if HAVE_NGHTTP2
+		/*
+		 * Drain back-to-back TCP segments in one reader turn when the kernel
+		 * already has the next segment (common on localhost). The first
+		 * DriverRecv may return only the preface + SETTINGS while HEADERS +
+		 * PRIORITY + WINDOW_UPDATE sit in a follow-on segment; without another
+		 * SockRead here, NsHttp2Feed's inner drain cannot see bytes that have
+		 * not been TLS-read yet (h2spec generic/2/3 after generic/2/2).
+		 */
+		{
+		    int h2TcpChain;
+
+		    for (h2TcpChain = 0; h2TcpChain < 8
+			    && sockPtr->state == SOCK_READWAIT
+			    && sockPtr->app_protocol == NS_APP_PROTO_H2
+			    && H2SockHasTcpInput(sockPtr);
+			    h2TcpChain++) {
+			SockRead(sockPtr);
+		    }
+		}
 		/*
 		 * After SSL WOULD_READ (DriverRecv n==0), return the socket to the
 		 * driver poll loop for POLLOUT / further reads. Use goto so the exit
@@ -3134,8 +3181,38 @@ ReaderThread(void *arg)
 		 */
 		if (sockPtr->state == SOCK_READWAIT
 			&& sockPtr->app_protocol == NS_APP_PROTO_H2) {
+		    /*
+		     * DriverRecv returned 0 (SSL WANT_READ) and asked to return to
+		     * the driver poll loop. If a follow-on TCP segment (or TLS
+		     * record) arrived before the next poll, peek / TLS pending can
+		     * show data while poll still omits POLLIN — retry SockRead here
+		     * instead of starving the second TLS read (h2spec generic/2/3
+		     * after generic/2/2).
+		     */
 		    if (sockPtr->h2NeedDriverPoll) {
-			goto readerDoneReadLoop;
+			if ((H2SockHasTcpInput(sockPtr)
+				|| H2SockHasTlsAppPending(sockPtr))
+				&& h2PeekRetries < 4u) {
+			    sockPtr->h2NeedDriverPoll = 0;
+			    h2PeekRetries++;
+			} else {
+			    /*
+			     * Follow-on TCP/TLS may arrive after DriverRecv returned 0;
+			     * ensure the driver polls again (h2spec generic/2/3 after
+			     * generic/2/2).
+			     */
+			    NsDriverTrigger(sockPtr->drvPtr);
+			    goto readerDoneReadLoop;
+			}
+		    }
+		    /*
+		     * nghttp2 may still want inbound frames while the reader burst
+		     * continues (TLS record split across reads). Wake the driver so
+		     * the next poll cannot miss POLLOUT/TLS follow-up (h2spec second
+		     * connection: generic/2/3 after generic/2/2).
+		     */
+		    if (NsHttp2WantReadInput(sockPtr)) {
+			NsDriverTrigger(sockPtr->drvPtr);
 		    }
 		    /*
 		     * Allow a small burst of SockRead calls per driver wakeup so the
@@ -3150,6 +3227,17 @@ ReaderThread(void *arg)
 	    } while (sockPtr->state == SOCK_READWAIT);
 	}
 readerDoneReadLoop:
+
+#if HAVE_NGHTTP2
+	/*
+	 * Flush SETTINGS ACK / TLS before returning to the driver so the peer
+	 * is not stuck waiting on read while we wait on poll (h2spec generic/2).
+	 */
+	if (sockPtr->state == SOCK_READWAIT
+		&& sockPtr->app_protocol == NS_APP_PROTO_H2) {
+	    NsHttp2ReaderYieldFlush(sockPtr);
+	}
+#endif
 
 	/*
 	 * Return the connection to the driver thread, freeing

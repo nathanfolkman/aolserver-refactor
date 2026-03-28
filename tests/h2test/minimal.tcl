@@ -42,6 +42,9 @@ ns_param   directoryfile   index.html
 ns_param   maxthreads      10
 ns_param   minthreads      2
 ns_param   maxconnections  100
+# Long h2spec/h3spec runs: avoid idle connection threads above minthreads exiting
+# mid-suite (default threadtimeout 30s in tcl/pools.tcl).
+ns_param   threadtimeout   600
 ns_param   urlcharset      utf-8
 
 ns_section ns/server/$servername/modules

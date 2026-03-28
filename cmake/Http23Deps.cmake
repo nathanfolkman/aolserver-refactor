@@ -15,6 +15,9 @@ ExternalProject_Add(nghttp2_ep
     # h2spec 5.1.7: unexpected CONTINUATION must be RST STREAM_CLOSED, not connection close.
     PATCH_COMMAND patch -d <SOURCE_DIR> -p1 -i "${CMAKE_CURRENT_LIST_DIR}/patches/nghttp2-1.61.0-disable-stream-reset-goaway.patch"
         && patch -d <SOURCE_DIR> -p1 -i "${CMAKE_CURRENT_LIST_DIR}/patches/nghttp2-1.61.0-unexpected-continuation-rst.patch"
+        && patch -d <SOURCE_DIR> -p1 -i "${CMAKE_CURRENT_LIST_DIR}/patches/nghttp2-1.61.0-priority-half-closed-remote.patch"
+        && patch -d <SOURCE_DIR> -p1 -i "${CMAKE_CURRENT_LIST_DIR}/patches/nghttp2-1.61.0-data-failfast-rst-stream.patch"
+        && patch -d <SOURCE_DIR> -p1 -i "${CMAKE_CURRENT_LIST_DIR}/patches/nghttp2-1.61.0-headers-half-closed-rst.patch"
     INSTALL_DIR "${DEPS_INSTALL_DIR}"
     BUILD_IN_SOURCE 1
     CONFIGURE_COMMAND <SOURCE_DIR>/configure --prefix=<INSTALL_DIR>
